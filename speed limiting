@@ -1,223 +1,172 @@
 #!/bin/bash
-# ==============================================================================
-# Script Name: LimitGuard v2.0
-# Description: Geo-aware Traffic Shaping & Audit Tool
-# OS Support:  Debian / Ubuntu
-# Author:      [Your Name/GitHub ID]
-# License:     MIT
-# ==============================================================================
+
+# ==================================================
+# 端口限速 & 状态监控脚本 (V2.0 增强版)
+# 功能：双向限速、端口连接可视化、可靠测速、交互菜单
+# ==================================================
 
 # 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+RED='\033[31m'
+GREEN='\033[32m'
+YELLOW='\033[33m'
+BLUE='\033[36m'
+PLAIN='\033[0m'
 
-LOG_DIR="/var/log/limit_guard"
-DATE_NOW=$(date "+%Y-%m-%d_%H-%M-%S")
+# 1. 自动获取网卡名称
+INTERFACE=$(ip route get 8.8.8.8 | awk '{print $5; exit}')
 
-# ------------------------------------------------------------------------------
-# 0. 环境自检
-# ------------------------------------------------------------------------------
-check_environment() {
-    if [[ $EUID -ne 0 ]]; then
-       echo -e "${RED}错误: 必须使用 root 权限运行。${NC}" 
-       exit 1
-    fi
+# 检查是否以root运行
+[[ $EUID -ne 0 ]] && echo -e "${RED}错误：${PLAIN} 必须使用 root 用户运行此脚本！\n" && exit 1
 
-    # 检查并自动安装依赖 (Debian/Ubuntu)
-    DEPENDENCIES=(iproute2 curl bc lsof coreutils grep gawk)
-    NEEDS_INSTALL=0
+# ================= 核心功能函数 =================
+
+# --- 功能 1：端口连接扫描 (优化中文显示 & 统计) ---
+function check_port_status() {
+    echo -e "${YELLOW}[INFO] 正在扫描活跃端口连接...${PLAIN}"
+    echo -e "------------------------------------------------------"
+    printf "%-10s %-15s %-10s %-20s\n" "协议" "本地端口" "连接数" "状态说明"
+    echo -e "------------------------------------------------------"
+
+    # 使用 ss 命令获取数据
+    # 过滤 TCP 和 UDP 监听及建立的连接
     
-    for pkg in "${DEPENDENCIES[@]}"; do
-        if ! command -v $pkg &> /dev/null; then NEEDS_INSTALL=1; fi
-    done
+    # 获取所有监听端口
+    listeners=$(ss -tunlp | grep LISTEN | awk '{print $1, $5}' | sed 's/.*://g')
+    
+    while read -r proto port; do
+        # 转换显示名称
+        if [[ "$proto" == "tcp" ]]; then
+            proto_cn="TCP连接"
+        elif [[ "$proto" == "udp" ]]; then
+            proto_cn="UDP连接"
+        else
+            proto_cn="未知"
+        fi
 
-    if [ $NEEDS_INSTALL -eq 1 ]; then
-        echo -e "${BLUE}[Init] 正在安装依赖...${NC}"
-        # 兼容处理: 如果 apt 被锁，等待一下
-        export DEBIAN_FRONTEND=noninteractive
-        apt-get update -qq && apt-get install -y -qq "${DEPENDENCIES[@]}"
+        # 统计该端口的活跃连接数 (ESTABLISHED)
+        conn_count=$(ss -tun | grep ":$port " | grep "ESTAB" | wc -l)
+        
+        printf "%-10s %-15s %-10s %-20s\n" "${proto_cn}" "${port}" "${conn_count}" "正在监听"
+    done <<< "$listeners"
+    echo -e "------------------------------------------------------"
+}
+
+# --- 功能 2：限速规则设置 (包含双向限速) ---
+function set_limit() {
+    read -p "请输入要限制的端口号 (例如 8080): " PORT
+    read -p "请输入限速带宽 (单位 Mbps, 例如 20): " RATE
+    
+    # 转换为 kbit (tc使用单位)
+    RATE_KBIT=$(($RATE * 1000))
+    BURST="100k" # 突发缓冲
+
+    echo -e "${YELLOW}[Processing] 正在对端口 $PORT 实施 $RATE Mbps 的双向限速...${PLAIN}"
+
+    # 清理旧规则 (防止冲突)
+    clear_rules_silent
+
+    # 1. 下行限速 (Egress - 服务器发出的数据)
+    # 建立根队列
+    tc qdisc add dev $INTERFACE root handle 1: htb default 10
+    # 建立主类，总带宽设大一点以免影响其他端口 (例如 10Gbps)
+    tc class add dev $INTERFACE parent 1: classid 1:1 htb rate 10000mbit
+    # 建立限速子类
+    tc class add dev $INTERFACE parent 1:1 classid 1:10 htb rate ${RATE_KBIT}kbit ceil ${RATE_KBIT}kbit burst $BURST
+    # 设置过滤器：匹配源端口是 $PORT 的包 (发给用户的)
+    tc filter add dev $INTERFACE protocol ip parent 1:0 prio 1 u32 match ip sport $PORT 0xffff flowid 1:10
+
+    # 2. 上行限速 (Ingress - 服务器接收的数据)
+    # 添加 ingress qdisc
+    tc qdisc add dev $INTERFACE handle ffff: ingress
+    # 设置过滤器：匹配目的端口是 $PORT 的包 (用户发来的)，超过速率丢弃
+    tc filter add dev $INTERFACE parent ffff: protocol ip u32 match ip dport $PORT 0xffff \
+    police rate ${RATE_KBIT}kbit burst $BURST drop flowid :1
+
+    echo -e "${GREEN}[Success] 限速已应用！${PLAIN}"
+    echo -e "端口: $PORT | 上行限制: ${RATE}Mbps | 下行限制: ${RATE}Mbps"
+    
+    # 询问是否测速
+    read -p "是否立即进行测速验证？(y/n): " test_choice
+    if [[ "$test_choice" == "y" ]]; then
+        run_speedtest
     fi
 }
 
-# ------------------------------------------------------------------------------
-# 1. 智能选点 (核心更新)
-# ------------------------------------------------------------------------------
-get_optimal_test_url() {
-    echo -e "${BLUE}[Geo] 正在定位 VPS 地理位置...${NC}"
-    
-    # 获取国家代码 (使用 ipapi.co 或 ip-api.com)
-    # 格式如: CN, US, JP, SG, HK, DE
-    COUNTRY_CODE=$(curl -s --max-time 5 https://ipapi.co/country/)
-    
-    # 如果接口失败，回退到 ip-api.com
-    if [ -z "$COUNTRY_CODE" ]; then
-        COUNTRY_CODE=$(curl -s --max-time 5 http://ip-api.com/csv | awk -F, '{print $2}')
-    fi
+# --- 功能 3：解除限速 ---
+function remove_limit() {
+    echo -e "${YELLOW}[Processing] 正在清除所有限速规则...${PLAIN}"
+    clear_rules_silent
+    echo -e "${GREEN}[Success] 限制已解除，网卡 $INTERFACE 恢复全速。${PLAIN}"
+}
 
-    echo -e "识别位置: ${YELLOW}$COUNTRY_CODE${NC}"
+function clear_rules_silent() {
+    # 静默清除规则，不报错
+    tc qdisc del dev $INTERFACE root >/dev/null 2>&1
+    tc qdisc del dev $INTERFACE ingress >/dev/null 2>&1
+}
+
+# --- 功能 4：可靠测速 (替换失效节点) ---
+function run_speedtest() {
+    echo -e "${YELLOW}[Testing] 开始测速验证 (使用 Cloudflare Global CDN)...${PLAIN}"
     
-    # 根据地理位置选择最近的 100MB/1GB 测速文件
-    # 选用 Vultr/Linode/DigitalOcean 的官方 Looking Glass，因为它们支持高并发且稳定
-    case "$COUNTRY_CODE" in
-        CN|HK|TW|MO)
-            # 香港/中国周边 -> 使用 Vultr 香港 或 Leaseweb 香港
-            echo -e ">> 匹配节点: 亚太地区 (Hong Kong)"
-            TEST_URL="http://hkg-vn-ping.vultr.com/vultr.com.100MB.bin"
+    # 使用 Cloudflare 的测速文件，非常稳定，不会像 DigitalOcean 某些节点那样 404
+    TEST_URL="http://speed.cloudflare.com/__down?bytes=50000000" # 50MB 测试文件
+    
+    echo -e "正在下载测试 (50MB)..."
+    # 使用 wget 的进度条显示速度，输出到 /dev/null
+    wget -O /dev/null "$TEST_URL" --report-speed=bits
+    
+    echo -e "\n${GREEN}[Done] 测速完成。${PLAIN}"
+    echo -e "注意：如果速度接近你设置的阈值，说明限速生效。"
+}
+
+# ================= 主菜单 =================
+function show_menu() {
+    clear
+    echo -e "=================================="
+    echo -e "   VPS 端口限速管理脚本 V2.0"
+    echo -e "   当前网卡: ${GREEN}${INTERFACE}${PLAIN}"
+    echo -e "=================================="
+    echo -e "1. 查看活跃端口连接 (优化版)"
+    echo -e "2. 设置端口限速 (双向限制)"
+    echo -e "3. 解除所有限速"
+    echo -e "4. 运行测速 (Cloudflare源)"
+    echo -e "0. 退出脚本"
+    echo -e "=================================="
+    read -p "请输入选项 [0-4]: " choice
+
+    case $choice in
+        1)
+            check_port_status
+            read -p "按回车键返回菜单..."
+            show_menu
             ;;
-        JP)
-            # 日本 -> Linode 东京
-            echo -e ">> 匹配节点: 亚太地区 (Tokyo)"
-            TEST_URL="http://speedtest.tokyo2.linode.com/100MB-tokyo2.bin"
+        2)
+            set_limit
+            read -p "按回车键返回菜单..."
+            show_menu
             ;;
-        SG|MY|TH|ID|VN)
-            # 新加坡/东南亚 -> DigitalOcean 新加坡
-            echo -e ">> 匹配节点: 东南亚 (Singapore)"
-            TEST_URL="http://speedtest-sgp1.digitalocean.com/100mb.test"
+        3)
+            remove_limit
+            read -p "按回车键返回菜单..."
+            show_menu
             ;;
-        US|CA|MX)
-            # 北美 -> DigitalOcean 旧金山 (通用性好)
-            echo -e ">> 匹配节点: 北美 (San Francisco)"
-            TEST_URL="http://speedtest-sfo3.digitalocean.com/100mb.test"
+        4)
+            run_speedtest
+            read -p "按回车键返回菜单..."
+            show_menu
             ;;
-        DE|FR|GB|NL|IT|ES|EU)
-            # 欧洲 -> Hetzner 德国 或 Vultr 法兰克福
-            echo -e ">> 匹配节点: 欧洲 (Frankfurt)"
-            TEST_URL="http://fra-de-ping.vultr.com/vultr.com.100MB.bin"
-            ;;
-        AU|NZ)
-            # 澳洲 -> Vultr 悉尼
-            echo -e ">> 匹配节点: 澳洲 (Sydney)"
-            TEST_URL="http://syd-au-ping.vultr.com/vultr.com.100MB.bin"
+        0)
+            echo "退出脚本。"
+            exit 0
             ;;
         *)
-            # 默认兜底 -> Cloudflare (Anycast，自动路由到最近)
-            echo -e ">> 未匹配特定区域，使用全球 Anycast 节点"
-            TEST_URL="http://speed.cloudflare.com/__down?bytes=100000000" 
+            echo -e "${RED}无效选项，请重试${PLAIN}"
+            sleep 1
+            show_menu
             ;;
     esac
 }
 
-# ------------------------------------------------------------------------------
-# 2. 辅助功能
-# ------------------------------------------------------------------------------
-get_interface() {
-    ip route get 8.8.8.8 | awk -- '{print $5}'
-}
-
-restore_service_on_exit() {
-    if [ ! -z "$FROZEN_PID" ]; then
-        echo -e "\n${YELLOW}[Trap] 正在恢复进程 PID $FROZEN_PID ...${NC}"
-        kill -CONT $FROZEN_PID 2>/dev/null
-    fi
-}
-trap restore_service_on_exit EXIT INT TERM
-
-# ------------------------------------------------------------------------------
-# 主逻辑
-# ------------------------------------------------------------------------------
-check_environment
-mkdir -p "$LOG_DIR"
-INTERFACE=$(get_interface)
-
-clear
-echo -e "${CYAN}====================================================${NC}"
-echo -e "${CYAN}     LimitGuard v2.0 (Geo-Aware Edition)            ${NC}"
-echo -e "${CYAN}====================================================${NC}"
-echo -e "网卡: ${GREEN}$INTERFACE${NC}"
-echo -e "日志: ${GREEN}$LOG_DIR${NC}"
-echo ""
-
-# 1. 自动选点
-get_optimal_test_url
-
-# 2. 端口选择
-echo -e "\n${YELLOW}[Step 1] 活跃端口扫描...${NC}"
-ss -tunlp | grep LISTEN | awk '{print "Proto:"$1, "Port:"$5, "Proc:"$7}' | column -t | sed 's/users:(//g' | sed 's/))//g' | head -n 10
-echo "..."
-
-while true; do
-    echo ""
-    read -p "请输入目标端口: " TARGET_PORT
-    if [[ ! "$TARGET_PORT" =~ ^[0-9]+$ ]]; then continue; fi
-    # 安全检查: SSH
-    SSH_PORT=$(echo $SSH_CLIENT | awk '{ print $3 }')
-    if [[ "$TARGET_PORT" == "$SSH_PORT" ]]; then
-        echo -e "${RED}禁止限制当前 SSH 连接端口!${NC}"; continue
-    fi
-    break
-done
-
-read -p "限制速率 (Mbps): " LIMIT_MBPS
-LIMIT_RATE="${LIMIT_MBPS}mbit"
-BURST_RATE=$(echo "$LIMIT_MBPS * 0.15" | bc)
-
-# 3. 取证
-LOG_FILE="$LOG_DIR/audit_${TARGET_PORT}_$(date +%s).log"
-echo -e "\n${YELLOW}[Step 2] 保存连接证据...${NC}"
-{
-    echo "Time: $DATE_NOW"
-    echo "Port: $TARGET_PORT / Limit: $LIMIT_MBPS Mbps"
-    echo "Test Node: $TEST_URL"
-    ss -tunap state established "( sport = :$TARGET_PORT )"
-} > "$LOG_FILE"
-echo -e "证据已保存: $LOG_FILE"
-
-# 4. 端口冻结
-echo -e "\n${YELLOW}[Step 3] 检查端口占用...${NC}"
-FROZEN_PID=$(lsof -t -i:$TARGET_PORT -sTCP:LISTEN)
-
-if [ -n "$FROZEN_PID" ]; then
-    P_NAME=$(ps -p $FROZEN_PID -o comm=)
-    echo -e "端口正被 ${CYAN}$P_NAME (PID $FROZEN_PID)${NC} 占用。"
-    read -p "是否暂停服务进行验证? (y/n): " CONFIRM
-    [[ "$CONFIRM" != "y" ]] && exit 0
-    kill -STOP $FROZEN_PID
-    echo "服务已挂起。"
-fi
-
-# 5. TC 限速
-echo -e "\n${YELLOW}[Step 4] 应用 TC 策略...${NC}"
-tc qdisc del dev $INTERFACE root 2>/dev/null
-tc qdisc add dev $INTERFACE root handle 1: htb default 10
-tc class add dev $INTERFACE parent 1: classid 1:1 htb rate 1000mbit
-tc class add dev $INTERFACE parent 1:1 classid 1:10 htb rate 1000mbit
-tc class add dev $INTERFACE parent 1:1 classid 1:20 htb rate $LIMIT_RATE ceil $LIMIT_RATE burst ${BURST_RATE}mbit
-tc filter add dev $INTERFACE protocol ip parent 1:0 prio 1 u32 match ip sport $TARGET_PORT 0xffff flowid 1:20
-tc filter add dev $INTERFACE protocol ipv6 parent 1:0 prio 1 u32 match ip6 sport $TARGET_PORT 0xffff flowid 1:20
-echo -e "限速已生效。"
-
-# 6. 验证
-echo -e "\n${YELLOW}[Step 5] 验证 (使用区域优化节点)...${NC}"
-echo "Test URL: $TEST_URL"
-SPEED_BYTE=$(curl --interface $INTERFACE --local-port $TARGET_PORT -m 15 -o /dev/null -s -w "%{speed_download}" "$TEST_URL")
-SPEED_ACTUAL=$(echo "scale=2; $SPEED_BYTE * 8 / 1000000" | bc)
-
-echo -e "---------------------------------"
-echo -e "目标: ${BLUE}$LIMIT_MBPS Mbps${NC}"
-echo -e "实测: ${BLUE}$SPEED_ACTUAL Mbps${NC}"
-echo -e "---------------------------------"
-
-# 误差判断 (放宽至 20% 以适应跨国线路波动)
-DIFF=$(echo "$SPEED_ACTUAL - $LIMIT_MBPS" | bc)
-if (( $(echo "$DIFF < 0" | bc -l) )); then DIFF=$(echo "$DIFF * -1" | bc); fi
-TOLERANCE=$(echo "$LIMIT_MBPS * 0.20" | bc)
-
-if (( $(echo "$DIFF <= $TOLERANCE" | bc -l) )); then
-    echo -e "${GREEN}✅ 验证通过!${NC}"
-else
-    echo -e "${RED}⚠️  验证存在偏差${NC}"
-    echo "提示: 即便选了最近节点，线路波动仍可能影响 TCP 吞吐。但限速规则在内核层是强制生效的。"
-fi
-
-# 7. 恢复
-if [ -n "$FROZEN_PID" ]; then
-    kill -CONT $FROZEN_PID
-    FROZEN_PID=""
-    echo -e "\n${GREEN}服务已恢复。${NC}"
-fi
-
-echo -e "\n${CYAN}任务完成。${NC}"
+# 启动脚本
+show_menu
