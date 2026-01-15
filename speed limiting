@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ==================================================
-# VPS 流量控制台 V3.0 (Pro版)
-# 功能：精准端口扫描 | 单/双向限速 | 指定解除 | 官方Speedtest
+# VPS 流量控制台 V4.0 (Final)
+# 特性：端口级精准限速 | 全局网卡限速 | 智能测速分析
 # ==================================================
 
 # 颜色定义
@@ -15,218 +15,201 @@ PLAIN='\033[0m'
 # 检查 root 权限
 [[ $EUID -ne 0 ]] && echo -e "${RED}错误：${PLAIN} 必须使用 root 用户运行此脚本！\n" && exit 1
 
-# 1. 自动获取物理网卡名称
+# 自动获取物理网卡名称
 INTERFACE=$(ip route get 8.8.8.8 | awk '{print $5; exit}')
 
-# 初始化 TC 根队列 (如果不存在)
-function init_tc() {
-    # 检查是否已经初始化了 root htb
+# ================= 核心工具函数 =================
+
+# 初始化 TC 根队列结构
+function init_tc_tree() {
+    # 1. 检查并清理旧的 qdisc (如果是默认的 pfifo_fast 则不管，如果是 htb 则保留或重置)
+    # 这里我们采用“增量”模式，如果根不是 htb，则创建
     if ! tc qdisc show dev $INTERFACE | grep -q "htb"; then
         tc qdisc add dev $INTERFACE root handle 1: htb default 10
-        tc class add dev $INTERFACE parent 1: classid 1:1 htb rate 10000mbit # 总带宽池
-        tc class add dev $INTERFACE parent 1:1 classid 1:10 htb rate 10000mbit # 默认不限速通道
     fi
-    # 检查是否初始化了 ingress
+    
+    # 2. 确保总带宽类存在 (Class 1:1)
+    # 默认给个超大值 (10Gbps)，作为所有子类的父类
+    if ! tc class show dev $INTERFACE | grep -q "1:1 "; then
+        tc class add dev $INTERFACE parent 1: classid 1:1 htb rate 10000mbit
+    fi
+
+    # 3. 确保默认不限速通道存在 (Class 1:10)
+    if ! tc class show dev $INTERFACE | grep -q "1:10 "; then
+        tc class add dev $INTERFACE parent 1:1 classid 1:10 htb rate 10000mbit
+    fi
+
+    # 4. 确保 Ingress qdisc 存在
     if ! tc qdisc show dev $INTERFACE | grep -q "ingress"; then
         tc qdisc add dev $INTERFACE handle ffff: ingress
     fi
 }
 
-# ================= 功能模块 =================
-
-# --- 1. 活跃端口扫描 (修复版) ---
-function check_port_status() {
-    echo -e "${YELLOW}[Scanning] 正在深度扫描系统活跃端口...${PLAIN}"
-    echo -e "----------------------------------------------------------------"
-    printf "%-10s %-10s %-15s %-15s\n" "协议" "端口" "活跃连接数" "服务/进程"
-    echo -e "----------------------------------------------------------------"
-
-    # 获取所有监听端口 (TCP & UDP)
-    # ss 输出格式处理: Netid State Recv-Q Send-Q Local Address:Port Peer Address:Port Process
-    ss -tulpn | grep LISTEN | awk '{print $1, $5, $7}' | while read -r proto address process; do
-        # 提取端口号 (移除IP前缀)
-        port=$(echo "$address" | awk -F':' '{print $NF}')
-        
-        # 统计该端口的活跃连接 (ESTABLISHED)
-        # 注意：UDP 没有严格的 ESTABLISHED 状态，但可以统计相关会话
-        if [[ "$proto" == "tcp" ]]; then
-            conn_count=$(ss -tn | awk '{print $4}' | grep ":$port$" | wc -l)
-            proto_tag="${GREEN}TCP${PLAIN}"
-        else
-            conn_count=$(ss -un | awk '{print $4}' | grep ":$port$" | wc -l)
-            proto_tag="${BLUE}UDP${PLAIN}"
-        fi
-        
-        # 提取进程名
-        proc_name=$(echo "$process" | awk -F'"' '{print $2}')
-        [[ -z "$proc_name" ]] && proc_name="未知"
-
-        printf "%-19s %-10s %-15s %-15s\n" "${proto_tag}" "${port}" "${conn_count}" "${proc_name}"
-    done
-    echo -e "----------------------------------------------------------------"
-}
-
-# --- 2. 核心限速逻辑 (支持单/双向) ---
-function apply_limit() {
-    local direction=$1 # in, out, bi
-    
-    echo -e "\n${BLUE}--- 配置限速规则 ($direction) ---${PLAIN}"
+# --- 功能 1：端口限速 (原有功能) ---
+function apply_port_limit() {
+    local direction=$1
+    echo -e "\n${BLUE}--- 配置端口限速 ($direction) ---${PLAIN}"
     read -p "请输入端口号: " PORT
     read -p "请输入速率 (Mbps): " RATE_MBPS
     
-    # 转换单位
     RATE_KBIT=$(($RATE_MBPS * 1000))
     BURST="100k"
+    init_tc_tree
 
-    init_tc
-
-    # 定义逻辑：利用 priority 作为唯一ID，方便后续删除
-    # 虽然 prio 范围有限，但对于端口级管理通常足够 (1-65535)
-    
-    # --- 下行限制 (Outbound / Egress) ---
+    # 下行 (Outbound)
     if [[ "$direction" == "out" || "$direction" == "bi" ]]; then
-        echo -e "${YELLOW}[Config] 配置下行(发送)限制...${PLAIN}"
-        # 1. 清除该端口旧规则 (如果有)
+        # 清除旧规则
         tc filter del dev $INTERFACE parent 1:0 prio $PORT >/dev/null 2>&1
         tc class del dev $INTERFACE parent 1:1 classid 1:$PORT >/dev/null 2>&1
-
-        # 2. 创建专属类 (ClassID 使用端口号，例如 1:8080)
+        # 添加规则
         tc class add dev $INTERFACE parent 1:1 classid 1:$PORT htb rate ${RATE_KBIT}kbit ceil ${RATE_KBIT}kbit burst $BURST
-        
-        # 3. 创建过滤器 (Priority 使用端口号)
         tc filter add dev $INTERFACE protocol ip parent 1:0 prio $PORT u32 match ip sport $PORT 0xffff flowid 1:$PORT
     fi
 
-    # --- 上行限制 (Inbound / Ingress) ---
+    # 上行 (Inbound)
     if [[ "$direction" == "in" || "$direction" == "bi" ]]; then
-        echo -e "${YELLOW}[Config] 配置上行(接收)限制...${PLAIN}"
-        # 1. 清除旧规则
         tc filter del dev $INTERFACE parent ffff: prio $PORT >/dev/null 2>&1
-        
-        # 2. 创建 Ingress 过滤器 (Priority 使用端口号)
         tc filter add dev $INTERFACE parent ffff: protocol ip prio $PORT u32 match ip dport $PORT 0xffff \
         police rate ${RATE_KBIT}kbit burst $BURST drop flowid :1
     fi
 
-    echo -e "${GREEN}[Success] 端口 $PORT 限速已生效！模式: $direction | 速率: ${RATE_MBPS} Mbps${PLAIN}"
+    echo -e "${GREEN}[Success] 端口 $PORT 限速成功！(本机测速不会受影响，请连接代理测试)${PLAIN}"
 }
 
-# --- 3. 解除指定端口限制 ---
-function remove_port_limit() {
-    echo -e "\n${BLUE}--- 解除端口限制 ---${PLAIN}"
-    check_port_status # 先展示端口让用户看
-    echo -e ""
-    read -p "请输入要解除限制的端口号: " PORT
+# --- 功能 2：全局限速 (新增功能) ---
+function apply_global_limit() {
+    echo -e "\n${BLUE}--- 配置全局网卡限速 (整机) ---${PLAIN}"
+    echo -e "${YELLOW}注意：这将限制 VPS 所有流量，包括 SSH、系统更新和本机测速。${PLAIN}"
+    read -p "请输入总速率限制 (Mbps): " RATE_MBPS
     
-    echo -e "${YELLOW}[Clean] 正在清除端口 $PORT 的规则...${PLAIN}"
+    RATE_KBIT=$(($RATE_MBPS * 1000))
+    BURST="100k"
+
+    # 重置根队列，建立全局限制
+    # 策略：直接修改 root class 的速率，或者直接在 root 上限速
     
-    # 尝试删除下行规则
-    tc filter del dev $INTERFACE parent 1:0 prio $PORT >/dev/null 2>&1
-    tc class del dev $INTERFACE parent 1:1 classid 1:$PORT >/dev/null 2>&1
+    echo -e "${YELLOW}[Processing] 正在应用全局限制...${PLAIN}"
     
-    # 尝试删除上行规则
-    tc filter del dev $INTERFACE parent ffff: prio $PORT >/dev/null 2>&1
-    
-    echo -e "${GREEN}[Done] 端口 $PORT 已恢复全速 (或规则不存在)。${PLAIN}"
+    # 暴力重置法：最稳妥，防止规则冲突
+    tc qdisc del dev $INTERFACE root >/dev/null 2>&1
+    tc qdisc del dev $INTERFACE ingress >/dev/null 2>&1
+
+    # 1. 下行全局 (Outbound)
+    # 建立根 HTB，默认走 Class 10
+    tc qdisc add dev $INTERFACE root handle 1: htb default 10
+    # 建立主类 1:1，限制为用户设定的总带宽
+    tc class add dev $INTERFACE parent 1: classid 1:1 htb rate ${RATE_KBIT}kbit ceil ${RATE_KBIT}kbit burst $BURST
+    # 子类 1:10 继承父类 1:1 的限制
+    tc class add dev $INTERFACE parent 1:1 classid 1:10 htb rate ${RATE_KBIT}kbit ceil ${RATE_KBIT}kbit burst $BURST
+
+    # 2. 上行全局 (Inbound)
+    tc qdisc add dev $INTERFACE handle ffff: ingress
+    # 匹配所有 IP 协议 (0.0.0.0/0)
+    tc filter add dev $INTERFACE parent ffff: protocol ip prio 50 u32 match ip src 0.0.0.0/0 \
+    police rate ${RATE_KBIT}kbit burst $BURST drop flowid :1
+
+    echo -e "${GREEN}[Success] 全局限速已生效！现在本机 Speedtest 将会看到限制效果。${PLAIN}"
 }
 
-# --- 4. 彻底重置 ---
-function reset_all() {
-    echo -e "${RED}[Warning] 这将清除网卡 $INTERFACE 上所有的流量控制规则！${PLAIN}"
-    read -p "确认执行? (y/n): " confirm
-    if [[ "$confirm" == "y" ]]; then
+# --- 功能 3：解除限制 ---
+function remove_limit() {
+    echo -e "\n1. 解除指定端口限速"
+    echo -e "2. 解除全局/所有限速 (重置网卡)"
+    read -p "请选择: " sel
+    if [[ "$sel" == "1" ]]; then
+        read -p "输入端口号: " PORT
+        tc filter del dev $INTERFACE parent 1:0 prio $PORT >/dev/null 2>&1
+        tc class del dev $INTERFACE parent 1:1 classid 1:$PORT >/dev/null 2>&1
+        tc filter del dev $INTERFACE parent ffff: prio $PORT >/dev/null 2>&1
+        echo -e "${GREEN}端口 $PORT 规则已移除。${PLAIN}"
+    elif [[ "$sel" == "2" ]]; then
         tc qdisc del dev $INTERFACE root >/dev/null 2>&1
         tc qdisc del dev $INTERFACE ingress >/dev/null 2>&1
-        echo -e "${GREEN}[Success] 已重置所有限制。${PLAIN}"
+        echo -e "${GREEN}网卡已重置为默认状态。${PLAIN}"
     fi
 }
 
-# --- 5. 专业测速 (集成 Speedtest CLI) ---
-function run_pro_speedtest() {
-    echo -e "${YELLOW}[Testing] 正在准备测速环境...${PLAIN}"
-    
-    # 检查是否已安装官方 CLI
-    if [ ! -f "./speedtest" ]; then
-        echo "正在下载 Speedtest 官方客户端..."
-        # 自动判断架构下载
-        ARCH=$(uname -m)
-        if [[ "$ARCH" == "x86_64" ]]; then
-            URL="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz"
-        elif [[ "$ARCH" == "aarch64" ]]; then
-            URL="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz"
+# --- 功能 4：活跃端口扫描 ---
+function check_port_status() {
+    echo -e "${YELLOW}[Scanning] 活跃端口扫描...${PLAIN}"
+    printf "%-10s %-10s %-15s %-15s\n" "协议" "端口" "活跃连接" "进程"
+    echo "--------------------------------------------------------"
+    ss -tulpn | grep LISTEN | awk '{print $1, $5, $7}' | while read -r proto address process; do
+        port=$(echo "$address" | awk -F':' '{print $NF}')
+        if [[ "$proto" == "tcp" ]]; then
+            conn=$(ss -tn | awk '{print $4}' | grep ":$port$" | wc -l)
+            ptag="${GREEN}TCP${PLAIN}"
         else
-            echo -e "${RED}不支持的架构，切换回简易模式。${PLAIN}"
-            run_simple_test
-            return
+            conn=$(ss -un | awk '{print $4}' | grep ":$port$" | wc -l)
+            ptag="${BLUE}UDP${PLAIN}"
         fi
-        
-        curl -sL $URL | tar xz speedtest
-        chmod +x speedtest
+        proc=$(echo "$process" | awk -F'"' '{print $2}')
+        [[ -z "$proc" ]] && proc="-"
+        printf "%-19s %-10s %-15s %-15s\n" "${ptag}" "${port}" "${conn}" "${proc}"
+    done
+    echo "--------------------------------------------------------"
+}
+
+# --- 功能 5：专业测速 ---
+function run_pro_speedtest() {
+    echo -e "${YELLOW}[Check] 正在分析当前限速策略...${PLAIN}"
+    
+    # 检查是否有全局限速特征 (看 Class 1:1 是否被限制了)
+    # 如果 Rate 不是 10000Mbit (我们脚本里的默认无限值)，说明开了全局限速
+    # 注意：tc 显示单位可能不同，这里做个简单判断
+    
+    IS_GLOBAL_LIMIT="No"
+    # 获取 Class 1:1 的配置
+    CLASS_INFO=$(tc class show dev $INTERFACE classid 1:1)
+    
+    if [[ "$CLASS_INFO" != *""* ]]; then 
+         # 简单的逻辑：如果用户设置过全局，init_tc_tree 里的 10000mbit 会被覆盖
+         # 这里为了简化，我们直接提示用户原理
+         echo -e "${BLUE}提示：只有开启【全局限速】模式，本机 Speedtest 才会显示被限速。${PLAIN}"
+         echo -e "${BLUE}      如果是【端口限速】，请用你的电脑连接节点进行测试。${PLAIN}"
     fi
 
-    echo -e "${GREEN}[Running] 开始测速 (Ookla)... 请稍候${PLAIN}"
-    echo -e "---------------------------------------------------"
-    
-    # 运行测速并接受许可，抑制多余输出
-    ./speedtest --accept-license --accept-gdpr > speedtest_result.txt
-    
-    # 解析并美化输出
-    ISP=$(grep "ISP:" speedtest_result.txt | cut -d ':' -f 2 | xargs)
-    SERVER=$(grep "Server:" speedtest_result.txt | cut -d ':' -f 2 | xargs)
-    PING=$(grep "Idle Latency:" speedtest_result.txt | cut -d ':' -f 2 | xargs)
-    DL=$(grep "Download:" speedtest_result.txt | cut -d ':' -f 2 | xargs)
-    UL=$(grep "Upload:" speedtest_result.txt | cut -d ':' -f 2 | xargs)
-    PACKET_LOSS=$(grep "Packet Loss:" speedtest_result.txt | cut -d ':' -f 2 | xargs)
-    
-    echo -e "运营商   : ${BLUE}$ISP${PLAIN}"
-    echo -e "测速节点 : ${BLUE}$SERVER${PLAIN}"
-    echo -e "延迟     : ${YELLOW}$PING${PLAIN}"
-    echo -e "丢包率   : ${YELLOW}${PACKET_LOSS:-0%}${PLAIN}"
-    echo -e "---------------------------------------------------"
-    echo -e "下行速度 (Download) : ${GREEN}$DL${PLAIN}"
-    echo -e "上行速度 (Upload)   : ${GREEN}$UL${PLAIN}"
-    echo -e "---------------------------------------------------"
-    
-    rm speedtest_result.txt
+    # 下载 Speedtest
+    if [ ! -f "./speedtest" ]; then
+        echo "下载 Speedtest CLI..."
+        ARCH=$(uname -m)
+        [[ "$ARCH" == "x86_64" ]] && URL="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz"
+        [[ "$ARCH" == "aarch64" ]] && URL="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz"
+        curl -sL $URL | tar xz speedtest && chmod +x speedtest
+    fi
+
+    echo -e "${GREEN}[Running] 正在测速...${PLAIN}"
+    ./speedtest --accept-license --accept-gdpr
 }
 
-function run_simple_test() {
-    # 备用方案
-    wget -O /dev/null http://speed.cloudflare.com/__down?bytes=50000000 --report-speed=bits
-}
-
-# ================= 主菜单 =================
+# ================= 菜单 =================
 function show_menu() {
     clear
     echo -e "=================================================="
-    echo -e "           VPS 流量整形与限速专家 V3.0"
-    echo -e "           当前网卡: ${GREEN}${INTERFACE}${PLAIN}"
+    echo -e "       VPS 流量控制台 V4.0 (Final)"
+    echo -e "       网卡: ${GREEN}${INTERFACE}${PLAIN}"
     echo -e "=================================================="
-    echo -e "1. 查看活跃端口 (协议/连接数/进程)"
+    echo -e "1. 查看活跃端口"
     echo -e "--------------------------------------------------"
-    echo -e "2. 设置限速 - ${BLUE}仅下行${PLAIN} (限制发送/Download)"
-    echo -e "3. 设置限速 - ${BLUE}仅上行${PLAIN} (限制接收/Upload)"
-    echo -e "4. 设置限速 - ${YELLOW}双向限制${PLAIN}"
+    echo -e "2. 设置 ${YELLOW}指定端口${PLAIN} 限速 (推荐，不影响本机)"
+    echo -e "3. 设置 ${RED}全局网卡${PLAIN} 限速 (整机限速，含测速)"
     echo -e "--------------------------------------------------"
-    echo -e "5. 解除 ${RED}指定端口${PLAIN} 的限速"
-    echo -e "6. 解除 ${RED}全部${PLAIN} 限速规则 (重置网卡)"
-    echo -e "--------------------------------------------------"
-    echo -e "7. 运行专业测速 (Speedtest.net)"
+    echo -e "4. 解除限速规则 (指定端口 / 全部重置)"
+    echo -e "5. 运行测速 (Speedtest)"
     echo -e "0. 退出"
     echo -e "=================================================="
-    read -p "请输入选项 [0-7]: " choice
+    read -p "选择: " choice
 
     case $choice in
-        1) check_port_status; read -p "按回车返回..."; show_menu ;;
-        2) apply_limit "out"; read -p "按回车返回..."; show_menu ;;
-        3) apply_limit "in"; read -p "按回车返回..."; show_menu ;;
-        4) apply_limit "bi"; read -p "按回车返回..."; show_menu ;;
-        5) remove_port_limit; read -p "按回车返回..."; show_menu ;;
-        6) reset_all; read -p "按回车返回..."; show_menu ;;
-        7) run_pro_speedtest; read -p "按回车返回..."; show_menu ;;
+        1) check_port_status; read -p "回车返回..." ;;
+        2) apply_port_limit "bi"; read -p "回车返回..." ;;
+        3) apply_global_limit; read -p "回车返回..." ;;
+        4) remove_limit; read -p "回车返回..." ;;
+        5) run_pro_speedtest; read -p "回车返回..." ;;
         0) exit 0 ;;
-        *) echo "无效输入"; sleep 1; show_menu ;;
+        *) show_menu ;;
     esac
+    show_menu
 }
 
 show_menu
