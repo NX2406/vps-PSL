@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ==================================================
-# VPS 流量控制台 V9.0 (Performance Tuned)
-# 核心修复：关闭网卡Offload防止卡死 | 优先级队列优化
+# VPS 流量控制台 V10.0 (Anti-Freeze / 防卡死版)
+# 核心技术：HTB + SFQ (随机公平队列) + SSH 保护
 # ==================================================
 
 # 颜色定义
@@ -18,64 +18,47 @@ PLAIN='\033[0m'
 # 获取网卡
 INTERFACE=$(ip route get 8.8.8.8 | awk '{print $5; exit}')
 
-# QUANTUM 设置
-USER_QUANTUM=15000
-ROOT_QUANTUM=200000
+# 自动检测 SSH 端口 (防止自己把自己限速导致失联)
+SSH_PORT=$(ss -tulpn | grep sshd | awk '{print $5}' | cut -d':' -f2 | head -n 1)
+[[ -z "$SSH_PORT" ]] && SSH_PORT=22
 
-# ================= 核心优化函数 (新增) =================
+# ================= 核心工具函数 =================
 
-function optimize_network() {
-    echo -e "${YELLOW}[System] 正在优化网络栈以防止流量整形卡顿...${PLAIN}"
-    
-    # 1. 检查并安装 ethtool (用于关闭 offloading)
-    if ! command -v ethtool &> /dev/null; then
-        echo "正在安装 ethtool..."
-        if [[ -f /etc/debian_version ]]; then
-            apt-get update -y && apt-get install ethtool -y
-        elif [[ -f /etc/redhat-release ]]; then
-            yum install ethtool -y
-        fi
-    fi
-
-    # 2. [关键] 关闭网卡卸载特性
-    # 这能解决开启限速后，未限速端口测速卡死/延迟飙升的问题
-    if command -v ethtool &> /dev/null; then
-        ethtool -K $INTERFACE tso off gso off gro off >/dev/null 2>&1
-        echo -e "${GREEN}[OK] 已关闭 GSO/TSO/GRO 硬件卸载 (提升 TC 稳定性)${PLAIN}"
-    else
-        echo -e "${RED}[Warn] ethtool 安装失败，跳过硬件优化。${PLAIN}"
-    fi
-}
-
-# ================= TC 初始化 =================
-
+# 初始化 TC 树 (核心改动：引入 SFQ)
 function init_tc_tree() {
-    optimize_network # 每次初始化前先优化
-
+    # 1. 如果没有 root htb，则创建
     if ! tc qdisc show dev $INTERFACE | grep -q "htb"; then
         tc qdisc add dev $INTERFACE root handle 1: htb default 10 r2q 10
     fi
     
-    # 建立总池 1:1
+    # 2. 建立总池 (10Gbps 虚拟上限)
     if ! tc class show dev $INTERFACE | grep -q "1:1 "; then
-        tc class add dev $INTERFACE parent 1: classid 1:1 htb rate 10000mbit quantum $ROOT_QUANTUM
+        tc class add dev $INTERFACE parent 1: classid 1:1 htb rate 10000mbit
     fi
     
-    # [关键优化] 建立默认通道 1:10 (未限速通道)
-    # 赋予 prio 0 (最高优先级)，确保正常流量不排队
+    # 3. [关键] 建立默认通道 (Class 1:10) - 承载未限速流量
     if ! tc class show dev $INTERFACE | grep -q "1:10 "; then
-        tc class add dev $INTERFACE parent 1:1 classid 1:10 htb rate 10000mbit prio 0 quantum $ROOT_QUANTUM
+        tc class add dev $INTERFACE parent 1:1 classid 1:10 htb rate 10000mbit prio 0
+        
+        # [防卡死核心] 为默认通道挂载 SFQ (随机公平队列)
+        # 作用：让大流量和小流量自动分流，防止测速时 SSH 卡死
+        tc qdisc add dev $INTERFACE parent 1:10 handle 10: sfq perturb 10
     fi
     
+    # 4. [SSH 保护] 显式添加 SSH 优先规则 (最高优先级 prio 0)
+    # 确保无论怎么测速，SSH 永远不排队
+    tc filter del dev $INTERFACE parent 1:0 prio 1 >/dev/null 2>&1
+    tc filter add dev $INTERFACE protocol ip parent 1:0 prio 1 u32 match ip sport $SSH_PORT 0xffff flowid 1:10
+
+    # 5. 初始化 Ingress (上行控制)
     if ! tc qdisc show dev $INTERFACE | grep -q "ingress"; then
         tc qdisc add dev $INTERFACE handle ffff: ingress
     fi
 }
 
-# ================= 辅助函数 =================
-
+# --- 辅助功能：活跃端口选择器 ---
 function select_active_port() {
-    echo -e "${YELLOW}[List] 活跃端口扫描...${PLAIN}"
+    echo -e "${YELLOW}[List] 活跃端口列表...${PLAIN}"
     echo -e "------------------------------------------------"
     printf "%-5s %-10s %-12s %-20s\n" "编号" "协议" "端口" "进程"
     echo -e "------------------------------------------------"
@@ -83,11 +66,16 @@ function select_active_port() {
     declare -a port_list
     index=1
 
+    # 排除 SSH 端口，防止误操作
     while read -r line; do
         proto=$(echo $line | awk '{print $1}')
         address=$(echo $line | awk '{print $2}')
         process=$(echo $line | awk '{print $3}')
         port=$(echo "$address" | awk -F':' '{print $NF}')
+        
+        # 如果是 SSH 端口，跳过显示
+        if [[ "$port" == "$SSH_PORT" ]]; then continue; fi
+
         proc_name=$(echo "$process" | awk -F'"' '{print $2}')
         [[ -z "$proc_name" ]] && proc_name="-"
 
@@ -116,8 +104,10 @@ function select_active_port() {
     fi
 }
 
+# --- 功能 1：查看状态 ---
 function check_port_status() {
     clear
+    echo -e "${YELLOW}[System] SSH端口: $SSH_PORT (已自动保护)${PLAIN}"
     echo -e "${YELLOW}[Scanning] 端口状态监控...${PLAIN}"
     echo -e "----------------------------------------------------------------------"
     printf "%-10s %-12s %-15s %-15s %-20s\n" "协议" "端口" "状态" "活跃连接数" "进程名"
@@ -151,6 +141,12 @@ function apply_port_limit() {
     [[ -z "$SELECTED_PORT" ]] && return
     PORT=$SELECTED_PORT
 
+    # 安全检查：禁止限制 SSH 端口
+    if [[ "$PORT" == "$SSH_PORT" ]]; then
+        echo -e "${RED}[Danger] 禁止对 SSH 端口 ($SSH_PORT) 进行限速，这会导致服务器失联！${PLAIN}"
+        return
+    fi
+
     echo -e "\n请选择限制方向："
     echo -e "1. ${GREEN}下行${PLAIN} (下载)"
     echo -e "2. ${GREEN}上行${PLAIN} (上传)"
@@ -167,26 +163,34 @@ function apply_port_limit() {
 
     init_tc_tree
 
-    echo -e "${YELLOW}[Config] 正在应用...${PLAIN}"
+    echo -e "${YELLOW}[Config] 正在应用 SFQ 智能流控...${PLAIN}"
 
+    # 下行 (Outbound)
     if [[ "$direction" == "out" || "$direction" == "bi" ]]; then
+        # 清理旧规则
         tc filter del dev $INTERFACE parent 1:0 prio $PORT >/dev/null 2>&1
+        tc qdisc del dev $INTERFACE parent 1:$HEX_ID >/dev/null 2>&1 # 清理旧子队列
         tc class del dev $INTERFACE parent 1:1 classid 1:$HEX_ID >/dev/null 2>&1
         
-        # [关键优化] 被限速的端口给予 prio 1 (低优先级)
-        # 这样当网络拥堵时，未限速的 prio 0 流量会优先通过，不会卡顿
-        tc class add dev $INTERFACE parent 1:1 classid 1:$HEX_ID htb rate ${RATE_KBIT}kbit ceil ${RATE_KBIT}kbit burst $BURST prio 1 quantum $USER_QUANTUM
+        # 1. 建立限速类 (prio 1, 比 SSH 低)
+        tc class add dev $INTERFACE parent 1:1 classid 1:$HEX_ID htb rate ${RATE_KBIT}kbit ceil ${RATE_KBIT}kbit burst $BURST prio 1 quantum 15000
         
+        # 2. [防卡死核心] 为该限速类挂载 SFQ
+        # 即使端口被占满，SFQ 也能保证 TCP 握手包有机会发出，防止 timeout
+        tc qdisc add dev $INTERFACE parent 1:$HEX_ID handle $HEX_ID: sfq perturb 10
+        
+        # 3. 建立过滤器
         tc filter add dev $INTERFACE protocol ip parent 1:0 prio $PORT u32 match ip sport $PORT 0xffff flowid 1:$HEX_ID
     fi
 
+    # 上行 (Inbound)
     if [[ "$direction" == "in" || "$direction" == "bi" ]]; then
         tc filter del dev $INTERFACE parent ffff: prio $PORT >/dev/null 2>&1
         tc filter add dev $INTERFACE parent ffff: protocol ip prio $PORT u32 match ip dport $PORT 0xffff \
         police rate ${RATE_KBIT}kbit burst $BURST drop flowid :1
     fi
 
-    echo -e "${GREEN}[Success] 端口 $PORT 限速生效 (低优先级)。${PLAIN}"
+    echo -e "${GREEN}[Success] 端口 $PORT 限速已生效 (已开启 SFQ 防堵塞)。${PLAIN}"
 }
 
 # --- 功能 3：全局限速 ---
@@ -196,25 +200,32 @@ function apply_global_limit() {
     RATE_KBIT=$(($RATE_MBPS * 1000))
     BURST="100k"
     
-    optimize_network
-    
+    # 彻底重置
     tc qdisc del dev $INTERFACE root >/dev/null 2>&1
     tc qdisc del dev $INTERFACE ingress >/dev/null 2>&1
 
+    # 重建根
     tc qdisc add dev $INTERFACE root handle 1: htb default 10 r2q 10
-    tc class add dev $INTERFACE parent 1: classid 1:1 htb rate ${RATE_KBIT}kbit ceil ${RATE_KBIT}kbit burst $BURST quantum $USER_QUANTUM
-    tc class add dev $INTERFACE parent 1:1 classid 1:10 htb rate ${RATE_KBIT}kbit ceil ${RATE_KBIT}kbit burst $BURST prio 0 quantum $USER_QUANTUM
+    
+    # 全局限制 (Class 1:1)
+    tc class add dev $INTERFACE parent 1: classid 1:1 htb rate ${RATE_KBIT}kbit ceil ${RATE_KBIT}kbit burst $BURST quantum 20000
+    
+    # 默认子类 + SFQ
+    tc class add dev $INTERFACE parent 1:1 classid 1:10 htb rate ${RATE_KBIT}kbit ceil ${RATE_KBIT}kbit burst $BURST prio 0 quantum 20000
+    tc qdisc add dev $INTERFACE parent 1:10 handle 10: sfq perturb 10
 
+    # Ingress
     tc qdisc add dev $INTERFACE handle ffff: ingress
     tc filter add dev $INTERFACE parent ffff: protocol ip prio 50 u32 match ip src 0.0.0.0/0 \
     police rate ${RATE_KBIT}kbit burst $BURST drop flowid :1
+
     echo -e "${GREEN}[Success] 全局限速生效。${PLAIN}"
 }
 
 # --- 功能 4：解除限制 ---
 function remove_limit() {
     echo -e "\n1. 解除指定端口"
-    echo -e "2. 重置所有 (恢复默认)"
+    echo -e "2. 重置所有 (恢复出厂)"
     read -p "选择: " sel
     
     if [[ "$sel" == "1" ]]; then
@@ -230,13 +241,16 @@ function remove_limit() {
         case $rm_choice in
             1) 
                 tc filter del dev $INTERFACE parent 1:0 prio $PORT >/dev/null 2>&1
+                tc qdisc del dev $INTERFACE parent 1:$HEX_ID >/dev/null 2>&1
                 tc class del dev $INTERFACE parent 1:1 classid 1:$HEX_ID >/dev/null 2>&1
                 echo -e "${GREEN}端口 $PORT [下行] 已移除。${PLAIN}" ;;
             2) 
                 tc filter del dev $INTERFACE parent ffff: prio $PORT >/dev/null 2>&1
                 echo -e "${GREEN}端口 $PORT [上行] 已移除。${PLAIN}" ;;
             *) 
+                # 全部移除
                 tc filter del dev $INTERFACE parent 1:0 prio $PORT >/dev/null 2>&1
+                tc qdisc del dev $INTERFACE parent 1:$HEX_ID >/dev/null 2>&1
                 tc class del dev $INTERFACE parent 1:1 classid 1:$HEX_ID >/dev/null 2>&1
                 tc filter del dev $INTERFACE parent ffff: prio $PORT >/dev/null 2>&1
                 echo -e "${GREEN}端口 $PORT [双向] 已移除。${PLAIN}" ;;
@@ -244,7 +258,6 @@ function remove_limit() {
     elif [[ "$sel" == "2" ]]; then
         tc qdisc del dev $INTERFACE root >/dev/null 2>&1
         tc qdisc del dev $INTERFACE ingress >/dev/null 2>&1
-        # 重置时最好也恢复 offloading，但通常保持关闭也没坏处，这里简单处理
         echo -e "${GREEN}限制已重置。${PLAIN}"
     fi
 }
@@ -264,12 +277,12 @@ function run_pro_speedtest() {
 function show_menu() {
     clear
     echo -e "=================================================="
-    echo -e "       VPS 流量控制台 V9.0 (Anti-Lag)"
-    echo -e "       网卡: ${GREEN}${INTERFACE}${PLAIN}"
+    echo -e "       VPS 流量控制台 V10.0 (Anti-Freeze)"
+    echo -e "       网卡: ${GREEN}${INTERFACE}${PLAIN} | SSH端口: ${YELLOW}${SSH_PORT}${PLAIN}"
     echo -e "=================================================="
     echo -e "1. 查看活跃端口"
     echo -e "--------------------------------------------------"
-    echo -e "2. 设置 ${YELLOW}端口限速${PLAIN} (自动优化防卡顿)"
+    echo -e "2. 设置 ${YELLOW}端口限速${PLAIN} (SFQ智能分流)"
     echo -e "3. 设置 ${RED}全局限速${PLAIN}"
     echo -e "--------------------------------------------------"
     echo -e "4. 解除限制 (支持方向选择)"
