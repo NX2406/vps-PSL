@@ -1,306 +1,63 @@
 #!/bin/bash
+# ==========================================
+# 网络协议栈深度复位工具 (终极版)
+# ==========================================
 
-# ==================================================
-# VPS 流量控制台 V10.0 (Anti-Freeze / 防卡死版)
-# 核心技术：HTB + SFQ (随机公平队列) + SSH 保护
-# ==================================================
+# 1. 锁定网卡
+IFACE=$(ip route get 8.8.8.8 | awk '{print $5; exit}')
+echo ">>> 当前网卡: $IFACE"
 
-# 颜色定义
-RED='\033[31m'
-GREEN='\033[32m'
-YELLOW='\033[33m'
-BLUE='\033[36m'
-PLAIN='\033[0m'
+# 2. 诊断：看看是不是还有 TC 规则在潜伏
+echo -e "\n[1/5] 正在检查残留的限速规则..."
+TC_CHECK=$(tc qdisc show dev $IFACE)
+if [[ $TC_CHECK == *"htb"* || $TC_CHECK == *"sfq"* || $TC_CHECK == *"ingress"* ]]; then
+    echo "警告：发现顽固规则！正在暴力清除..."
+    tc qdisc del dev $IFACE root >/dev/null 2>&1
+    tc qdisc del dev $IFACE ingress >/dev/null 2>&1
+    echo ">>> 清除完毕。"
+else
+    echo ">>> 未发现 TC 限速规则 (说明限速本身已解除)。"
+fi
 
-# 检查 root
-[[ $EUID -ne 0 ]] && echo -e "${RED}错误：请使用 root 用户运行！${PLAIN}" && exit 1
+# 3. 诊断：检查防火墙是否被脚本修改
+echo -e "\n[2/5] 正在重置防火墙规则 (防止丢包策略残留)..."
+# 备份一下防止误删关键规则，但为了恢复通常建议全清
+iptables -P INPUT ACCEPT
+iptables -P FORWARD ACCEPT
+iptables -P OUTPUT ACCEPT
+iptables -t nat -F
+iptables -t mangle -F
+iptables -F
+iptables -X
+echo ">>> 防火墙已重置为全放行状态。"
 
-# 获取网卡
-INTERFACE=$(ip route get 8.8.8.8 | awk '{print $5; exit}')
+# 4. 诊断：检查网卡 MTU 和 队列长度
+echo -e "\n[3/5] 正在恢复网卡物理参数..."
+ip link set dev $IFACE mtu 1500
+if command -v ethtool &>/dev/null; then
+    ethtool -K $IFACE tso on gso on gro on >/dev/null 2>&1
+fi
+echo ">>> 网卡 MTU/Offload 已恢复默认。"
 
-# 自动检测 SSH 端口 (防止自己把自己限速导致失联)
-SSH_PORT=$(ss -tulpn | grep sshd | awk '{print $5}' | cut -d':' -f2 | head -n 1)
-[[ -z "$SSH_PORT" ]] && SSH_PORT=22
-
-# ================= 核心工具函数 =================
-
-# 初始化 TC 树 (核心改动：引入 SFQ)
-function init_tc_tree() {
-    # 1. 如果没有 root htb，则创建
-    if ! tc qdisc show dev $INTERFACE | grep -q "htb"; then
-        tc qdisc add dev $INTERFACE root handle 1: htb default 10 r2q 10
+# 5. 诊断：清理可能存在的残留文件
+echo -e "\n[4/5] 检查开机自启残留..."
+# 检查 rc.local 中是否还有 limit.sh
+if [ -f /etc/rc.local ]; then
+    if grep -q "limit.sh" /etc/rc.local; then
+        echo "警告：发现 rc.local 中有脚本残留，正在剔除..."
+        sed -i '/limit.sh/d' /etc/rc.local
     fi
-    
-    # 2. 建立总池 (10Gbps 虚拟上限)
-    if ! tc class show dev $INTERFACE | grep -q "1:1 "; then
-        tc class add dev $INTERFACE parent 1: classid 1:1 htb rate 10000mbit
-    fi
-    
-    # 3. [关键] 建立默认通道 (Class 1:10) - 承载未限速流量
-    if ! tc class show dev $INTERFACE | grep -q "1:10 "; then
-        tc class add dev $INTERFACE parent 1:1 classid 1:10 htb rate 10000mbit prio 0
-        
-        # [防卡死核心] 为默认通道挂载 SFQ (随机公平队列)
-        # 作用：让大流量和小流量自动分流，防止测速时 SSH 卡死
-        tc qdisc add dev $INTERFACE parent 1:10 handle 10: sfq perturb 10
-    fi
-    
-    # 4. [SSH 保护] 显式添加 SSH 优先规则 (最高优先级 prio 0)
-    # 确保无论怎么测速，SSH 永远不排队
-    tc filter del dev $INTERFACE parent 1:0 prio 1 >/dev/null 2>&1
-    tc filter add dev $INTERFACE protocol ip parent 1:0 prio 1 u32 match ip sport $SSH_PORT 0xffff flowid 1:10
+fi
+echo ">>> 自启检查完毕。"
 
-    # 5. 初始化 Ingress (上行控制)
-    if ! tc qdisc show dev $INTERFACE | grep -q "ingress"; then
-        tc qdisc add dev $INTERFACE handle ffff: ingress
-    fi
-}
+# 6. 验证：直接拉取文件测试 (避开 Speedtest 节点抽风问题)
+echo -e "\n[5/5] 最终验证：直接从 Cloudflare 拉取文件测速..."
+echo "正在测试下行速度 (目标: 恢复正常带宽)..."
+# 使用 curl 打印速度，超时时间 10秒
+curl -o /dev/null http://speed.cloudflare.com/__down?bytes=50000000 -w "\n下载速度: %{speed_download} byte/s\n" --connect-timeout 5 --max-time 15
 
-# --- 辅助功能：活跃端口选择器 ---
-function select_active_port() {
-    echo -e "${YELLOW}[List] 活跃端口列表...${PLAIN}"
-    echo -e "------------------------------------------------"
-    printf "%-5s %-10s %-12s %-20s\n" "编号" "协议" "端口" "进程"
-    echo -e "------------------------------------------------"
-
-    declare -a port_list
-    index=1
-
-    # 排除 SSH 端口，防止误操作
-    while read -r line; do
-        proto=$(echo $line | awk '{print $1}')
-        address=$(echo $line | awk '{print $2}')
-        process=$(echo $line | awk '{print $3}')
-        port=$(echo "$address" | awk -F':' '{print $NF}')
-        
-        # 如果是 SSH 端口，跳过显示
-        if [[ "$port" == "$SSH_PORT" ]]; then continue; fi
-
-        proc_name=$(echo "$process" | awk -F'"' '{print $2}')
-        [[ -z "$proc_name" ]] && proc_name="-"
-
-        port_list[$index]=$port
-        printf "${GREEN}[%d]${PLAIN}   %-10s %-12s %-20s\n" "$index" "$proto" "$port" "$proc_name"
-        ((index++))
-    done < <(ss -tulpn | grep LISTEN | awk '{print $1, $5, $7}')
-
-    echo -e "------------------------------------------------"
-    echo -e "${GREEN}[m]${PLAIN}   手动输入"
-    echo -e "------------------------------------------------"
-    
-    read -p "请选择编号: " select_idx
-
-    if [[ "$select_idx" == "m" ]]; then
-        read -p "端口号: " input_port
-        if ! [[ "$input_port" =~ ^[0-9]+$ ]]; then
-            echo -e "${RED}错误：必须是数字${PLAIN}"; SELECTED_PORT=""; return
-        fi
-        SELECTED_PORT=$input_port
-    elif [[ -n "${port_list[$select_idx]}" ]]; then
-        SELECTED_PORT="${port_list[$select_idx]}"
-        echo -e "${BLUE}选中端口: $SELECTED_PORT${PLAIN}"
-    else
-        echo -e "${RED}无效选择${PLAIN}"; SELECTED_PORT=""
-    fi
-}
-
-# --- 功能 1：查看状态 ---
-function check_port_status() {
-    clear
-    echo -e "${YELLOW}[System] SSH端口: $SSH_PORT (已自动保护)${PLAIN}"
-    echo -e "${YELLOW}[Scanning] 端口状态监控...${PLAIN}"
-    echo -e "----------------------------------------------------------------------"
-    printf "%-10s %-12s %-15s %-15s %-20s\n" "协议" "端口" "状态" "活跃连接数" "进程名"
-    echo -e "----------------------------------------------------------------------"
-
-    ss -tulpn | grep LISTEN | awk '{print $1, $5, $7}' | while read -r proto address process; do
-        port=$(echo "$address" | awk -F':' '{print $NF}')
-        if [[ "$proto" == "tcp" ]]; then
-            ptag="TCP"; pcolor="${GREEN}"
-            conn=$(ss -tn state established | awk '{print $4}' | grep -w ":$port" | wc -l)
-        else
-            ptag="UDP"; pcolor="${BLUE}"
-            conn=$(ss -un | awk '{print $4}' | grep -w ":$port" | wc -l)
-        fi
-        proc=$(echo "$process" | awk -F'"' '{print $2}')
-        [[ -z "$proc" ]] && proc="-"
-        if [[ "$conn" -gt 0 ]]; then
-            conn_str="${conn} (Active)"; conn_color="${RED}"
-        else
-            conn_str="0"; conn_color="${PLAIN}"
-        fi
-        printf "${pcolor}%-10s${PLAIN} %-12s %-15s ${conn_color}%-15s${PLAIN} %-20s\n" "$ptag" "$port" "Listening" "$conn_str" "$proc"
-    done
-    echo -e "----------------------------------------------------------------------"
-}
-
-# --- 功能 2：端口限速 ---
-function apply_port_limit() {
-    echo -e "\n${BLUE}--- 配置端口限速 ---${PLAIN}"
-    select_active_port
-    [[ -z "$SELECTED_PORT" ]] && return
-    PORT=$SELECTED_PORT
-
-    # 安全检查：禁止限制 SSH 端口
-    if [[ "$PORT" == "$SSH_PORT" ]]; then
-        echo -e "${RED}[Danger] 禁止对 SSH 端口 ($SSH_PORT) 进行限速，这会导致服务器失联！${PLAIN}"
-        return
-    fi
-
-    echo -e "\n请选择限制方向："
-    echo -e "1. ${GREEN}下行${PLAIN} (下载)"
-    echo -e "2. ${GREEN}上行${PLAIN} (上传)"
-    echo -e "3. ${YELLOW}双向${PLAIN}"
-    read -p "选项 [1-3]: " dir_choice
-    case $dir_choice in
-        1) direction="out" ;; 2) direction="in" ;; 3) direction="bi" ;; *) direction="bi" ;;
-    esac
-
-    read -p "速率 (Mbps): " RATE_MBPS
-    RATE_KBIT=$(($RATE_MBPS * 1000))
-    BURST="100k"
-    HEX_ID=$(printf '%x' $PORT)
-
-    init_tc_tree
-
-    echo -e "${YELLOW}[Config] 正在应用 SFQ 智能流控...${PLAIN}"
-
-    # 下行 (Outbound)
-    if [[ "$direction" == "out" || "$direction" == "bi" ]]; then
-        # 清理旧规则
-        tc filter del dev $INTERFACE parent 1:0 prio $PORT >/dev/null 2>&1
-        tc qdisc del dev $INTERFACE parent 1:$HEX_ID >/dev/null 2>&1 # 清理旧子队列
-        tc class del dev $INTERFACE parent 1:1 classid 1:$HEX_ID >/dev/null 2>&1
-        
-        # 1. 建立限速类 (prio 1, 比 SSH 低)
-        tc class add dev $INTERFACE parent 1:1 classid 1:$HEX_ID htb rate ${RATE_KBIT}kbit ceil ${RATE_KBIT}kbit burst $BURST prio 1 quantum 15000
-        
-        # 2. [防卡死核心] 为该限速类挂载 SFQ
-        # 即使端口被占满，SFQ 也能保证 TCP 握手包有机会发出，防止 timeout
-        tc qdisc add dev $INTERFACE parent 1:$HEX_ID handle $HEX_ID: sfq perturb 10
-        
-        # 3. 建立过滤器
-        tc filter add dev $INTERFACE protocol ip parent 1:0 prio $PORT u32 match ip sport $PORT 0xffff flowid 1:$HEX_ID
-    fi
-
-    # 上行 (Inbound)
-    if [[ "$direction" == "in" || "$direction" == "bi" ]]; then
-        tc filter del dev $INTERFACE parent ffff: prio $PORT >/dev/null 2>&1
-        tc filter add dev $INTERFACE parent ffff: protocol ip prio $PORT u32 match ip dport $PORT 0xffff \
-        police rate ${RATE_KBIT}kbit burst $BURST drop flowid :1
-    fi
-
-    echo -e "${GREEN}[Success] 端口 $PORT 限速已生效 (已开启 SFQ 防堵塞)。${PLAIN}"
-}
-
-# --- 功能 3：全局限速 ---
-function apply_global_limit() {
-    echo -e "\n${BLUE}--- 全局限速 ---${PLAIN}"
-    read -p "总速率 (Mbps): " RATE_MBPS
-    RATE_KBIT=$(($RATE_MBPS * 1000))
-    BURST="100k"
-    
-    # 彻底重置
-    tc qdisc del dev $INTERFACE root >/dev/null 2>&1
-    tc qdisc del dev $INTERFACE ingress >/dev/null 2>&1
-
-    # 重建根
-    tc qdisc add dev $INTERFACE root handle 1: htb default 10 r2q 10
-    
-    # 全局限制 (Class 1:1)
-    tc class add dev $INTERFACE parent 1: classid 1:1 htb rate ${RATE_KBIT}kbit ceil ${RATE_KBIT}kbit burst $BURST quantum 20000
-    
-    # 默认子类 + SFQ
-    tc class add dev $INTERFACE parent 1:1 classid 1:10 htb rate ${RATE_KBIT}kbit ceil ${RATE_KBIT}kbit burst $BURST prio 0 quantum 20000
-    tc qdisc add dev $INTERFACE parent 1:10 handle 10: sfq perturb 10
-
-    # Ingress
-    tc qdisc add dev $INTERFACE handle ffff: ingress
-    tc filter add dev $INTERFACE parent ffff: protocol ip prio 50 u32 match ip src 0.0.0.0/0 \
-    police rate ${RATE_KBIT}kbit burst $BURST drop flowid :1
-
-    echo -e "${GREEN}[Success] 全局限速生效。${PLAIN}"
-}
-
-# --- 功能 4：解除限制 ---
-function remove_limit() {
-    echo -e "\n1. 解除指定端口"
-    echo -e "2. 重置所有 (恢复出厂)"
-    read -p "选择: " sel
-    
-    if [[ "$sel" == "1" ]]; then
-        select_active_port
-        [[ -z "$SELECTED_PORT" ]] && return
-        PORT=$SELECTED_PORT
-        HEX_ID=$(printf '%x' $PORT)
-        
-        echo -e "\n1. 仅解除 ${GREEN}下行${PLAIN}"
-        echo -e "2. 仅解除 ${GREEN}上行${PLAIN}"
-        echo -e "3. 解除 ${RED}双向${PLAIN}"
-        read -p "选项: " rm_choice
-        case $rm_choice in
-            1) 
-                tc filter del dev $INTERFACE parent 1:0 prio $PORT >/dev/null 2>&1
-                tc qdisc del dev $INTERFACE parent 1:$HEX_ID >/dev/null 2>&1
-                tc class del dev $INTERFACE parent 1:1 classid 1:$HEX_ID >/dev/null 2>&1
-                echo -e "${GREEN}端口 $PORT [下行] 已移除。${PLAIN}" ;;
-            2) 
-                tc filter del dev $INTERFACE parent ffff: prio $PORT >/dev/null 2>&1
-                echo -e "${GREEN}端口 $PORT [上行] 已移除。${PLAIN}" ;;
-            *) 
-                # 全部移除
-                tc filter del dev $INTERFACE parent 1:0 prio $PORT >/dev/null 2>&1
-                tc qdisc del dev $INTERFACE parent 1:$HEX_ID >/dev/null 2>&1
-                tc class del dev $INTERFACE parent 1:1 classid 1:$HEX_ID >/dev/null 2>&1
-                tc filter del dev $INTERFACE parent ffff: prio $PORT >/dev/null 2>&1
-                echo -e "${GREEN}端口 $PORT [双向] 已移除。${PLAIN}" ;;
-        esac
-    elif [[ "$sel" == "2" ]]; then
-        tc qdisc del dev $INTERFACE root >/dev/null 2>&1
-        tc qdisc del dev $INTERFACE ingress >/dev/null 2>&1
-        echo -e "${GREEN}限制已重置。${PLAIN}"
-    fi
-}
-
-function run_pro_speedtest() {
-    echo -e "${YELLOW}[Testing] Speedtest...${PLAIN}"
-    if [ ! -f "./speedtest" ]; then
-        ARCH=$(uname -m)
-        [[ "$ARCH" == "x86_64" ]] && URL="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz"
-        [[ "$ARCH" == "aarch64" ]] && URL="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz"
-        curl -sL $URL | tar xz speedtest && chmod +x speedtest
-    fi
-    ./speedtest --accept-license --accept-gdpr
-}
-
-# ================= 菜单 =================
-function show_menu() {
-    clear
-    echo -e "=================================================="
-    echo -e "       VPS 流量控制台 V10.0 (Anti-Freeze)"
-    echo -e "       网卡: ${GREEN}${INTERFACE}${PLAIN} | SSH端口: ${YELLOW}${SSH_PORT}${PLAIN}"
-    echo -e "=================================================="
-    echo -e "1. 查看活跃端口"
-    echo -e "--------------------------------------------------"
-    echo -e "2. 设置 ${YELLOW}端口限速${PLAIN} (SFQ智能分流)"
-    echo -e "3. 设置 ${RED}全局限速${PLAIN}"
-    echo -e "--------------------------------------------------"
-    echo -e "4. 解除限制 (支持方向选择)"
-    echo -e "5. 运行测速"
-    echo -e "0. 退出"
-    echo -e "=================================================="
-    read -p "选择: " choice
-
-    case $choice in
-        1) check_port_status; read -p "回车返回..." ;;
-        2) apply_port_limit; read -p "回车返回..." ;;
-        3) apply_global_limit; read -p "回车返回..." ;;
-        4) remove_limit; read -p "回车返回..." ;;
-        5) run_pro_speedtest; read -p "回车返回..." ;;
-        0) exit 0 ;;
-        *) show_menu ;;
-    esac
-    show_menu
-}
-
-show_menu
+echo -e "\n=========================================="
+echo " 如果上面的下载速度显示正常 (如几MB/s或几十MB/s)，"
+echo " 说明你的 VPS 网络已完全恢复！"
+echo " 如果依然只有几KB，说明大概率是被 VPS 商家限速了。"
+echo "=========================================="
