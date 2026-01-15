@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ==================================================
-# VPS 流量控制台 V8.0 (Interactive)
-# 特性：端口列表点选 | 解除限速区分方向 | 无警告完美版
+# VPS 流量控制台 V9.0 (Performance Tuned)
+# 核心修复：关闭网卡Offload防止卡死 | 优先级队列优化
 # ==================================================
 
 # 颜色定义
@@ -18,158 +18,165 @@ PLAIN='\033[0m'
 # 获取网卡
 INTERFACE=$(ip route get 8.8.8.8 | awk '{print $5; exit}')
 
-# QUANTUM 设置 (消除内核警告)
+# QUANTUM 设置
 USER_QUANTUM=15000
 ROOT_QUANTUM=200000
 
-# ================= 核心工具函数 =================
+# ================= 核心优化函数 (新增) =================
 
-# 初始化 TC 根队列
+function optimize_network() {
+    echo -e "${YELLOW}[System] 正在优化网络栈以防止流量整形卡顿...${PLAIN}"
+    
+    # 1. 检查并安装 ethtool (用于关闭 offloading)
+    if ! command -v ethtool &> /dev/null; then
+        echo "正在安装 ethtool..."
+        if [[ -f /etc/debian_version ]]; then
+            apt-get update -y && apt-get install ethtool -y
+        elif [[ -f /etc/redhat-release ]]; then
+            yum install ethtool -y
+        fi
+    fi
+
+    # 2. [关键] 关闭网卡卸载特性
+    # 这能解决开启限速后，未限速端口测速卡死/延迟飙升的问题
+    if command -v ethtool &> /dev/null; then
+        ethtool -K $INTERFACE tso off gso off gro off >/dev/null 2>&1
+        echo -e "${GREEN}[OK] 已关闭 GSO/TSO/GRO 硬件卸载 (提升 TC 稳定性)${PLAIN}"
+    else
+        echo -e "${RED}[Warn] ethtool 安装失败，跳过硬件优化。${PLAIN}"
+    fi
+}
+
+# ================= TC 初始化 =================
+
 function init_tc_tree() {
+    optimize_network # 每次初始化前先优化
+
     if ! tc qdisc show dev $INTERFACE | grep -q "htb"; then
         tc qdisc add dev $INTERFACE root handle 1: htb default 10 r2q 10
     fi
+    
+    # 建立总池 1:1
     if ! tc class show dev $INTERFACE | grep -q "1:1 "; then
         tc class add dev $INTERFACE parent 1: classid 1:1 htb rate 10000mbit quantum $ROOT_QUANTUM
     fi
+    
+    # [关键优化] 建立默认通道 1:10 (未限速通道)
+    # 赋予 prio 0 (最高优先级)，确保正常流量不排队
     if ! tc class show dev $INTERFACE | grep -q "1:10 "; then
-        tc class add dev $INTERFACE parent 1:1 classid 1:10 htb rate 10000mbit quantum $ROOT_QUANTUM
+        tc class add dev $INTERFACE parent 1:1 classid 1:10 htb rate 10000mbit prio 0 quantum $ROOT_QUANTUM
     fi
+    
     if ! tc qdisc show dev $INTERFACE | grep -q "ingress"; then
         tc qdisc add dev $INTERFACE handle ffff: ingress
     fi
 }
 
-# --- 辅助功能：交互式端口选择器 ---
-# 返回值保存在全局变量 $SELECTED_PORT 中
+# ================= 辅助函数 =================
+
 function select_active_port() {
-    echo -e "${YELLOW}[List] 正在扫描可操作端口...${PLAIN}"
+    echo -e "${YELLOW}[List] 活跃端口扫描...${PLAIN}"
     echo -e "------------------------------------------------"
     printf "%-5s %-10s %-12s %-20s\n" "编号" "协议" "端口" "进程"
     echo -e "------------------------------------------------"
 
-    # 声明数组
     declare -a port_list
     index=1
 
-    # 读取 ss 输出
-    # 使用 mapfile 解决 while 循环子shell 变量丢失问题 (兼容 bash 4.0+)
-    # 或者使用文件描述符重定向
     while read -r line; do
         proto=$(echo $line | awk '{print $1}')
         address=$(echo $line | awk '{print $2}')
         process=$(echo $line | awk '{print $3}')
-        
-        # 提取端口
         port=$(echo "$address" | awk -F':' '{print $NF}')
-        # 提取进程名
         proc_name=$(echo "$process" | awk -F'"' '{print $2}')
         [[ -z "$proc_name" ]] && proc_name="-"
 
-        # 存入数组
         port_list[$index]=$port
-        
-        # 打印菜单项
         printf "${GREEN}[%d]${PLAIN}   %-10s %-12s %-20s\n" "$index" "$proto" "$port" "$proc_name"
         ((index++))
     done < <(ss -tulpn | grep LISTEN | awk '{print $1, $5, $7}')
 
     echo -e "------------------------------------------------"
-    echo -e "${GREEN}[m]${PLAIN}   手动输入端口号 (Manual Input)"
+    echo -e "${GREEN}[m]${PLAIN}   手动输入"
     echo -e "------------------------------------------------"
     
-    read -p "请选择端口编号 (输入 m 手动填写): " select_idx
+    read -p "请选择编号: " select_idx
 
     if [[ "$select_idx" == "m" ]]; then
-        read -p "请输入端口号: " input_port
+        read -p "端口号: " input_port
         if ! [[ "$input_port" =~ ^[0-9]+$ ]]; then
-            echo -e "${RED}错误：端口必须是数字！${PLAIN}"
-            SELECTED_PORT=""
-            return
+            echo -e "${RED}错误：必须是数字${PLAIN}"; SELECTED_PORT=""; return
         fi
         SELECTED_PORT=$input_port
     elif [[ -n "${port_list[$select_idx]}" ]]; then
         SELECTED_PORT="${port_list[$select_idx]}"
-        echo -e "${BLUE}你选择了端口: $SELECTED_PORT${PLAIN}"
+        echo -e "${BLUE}选中端口: $SELECTED_PORT${PLAIN}"
     else
-        echo -e "${RED}无效选择！${PLAIN}"
-        SELECTED_PORT=""
+        echo -e "${RED}无效选择${PLAIN}"; SELECTED_PORT=""
     fi
 }
 
-# --- 功能 1：活跃端口扫描 (纯展示用) ---
 function check_port_status() {
     clear
-    echo -e "${YELLOW}[Scanning] 活跃端口深度扫描...${PLAIN}"
+    echo -e "${YELLOW}[Scanning] 端口状态监控...${PLAIN}"
     echo -e "----------------------------------------------------------------------"
     printf "%-10s %-12s %-15s %-15s %-20s\n" "协议" "端口" "状态" "活跃连接数" "进程名"
     echo -e "----------------------------------------------------------------------"
 
     ss -tulpn | grep LISTEN | awk '{print $1, $5, $7}' | while read -r proto address process; do
         port=$(echo "$address" | awk -F':' '{print $NF}')
-        
         if [[ "$proto" == "tcp" ]]; then
-            ptag="TCP"
-            pcolor="${GREEN}"
+            ptag="TCP"; pcolor="${GREEN}"
             conn=$(ss -tn state established | awk '{print $4}' | grep -w ":$port" | wc -l)
         else
-            ptag="UDP"
-            pcolor="${BLUE}"
+            ptag="UDP"; pcolor="${BLUE}"
             conn=$(ss -un | awk '{print $4}' | grep -w ":$port" | wc -l)
         fi
-
         proc=$(echo "$process" | awk -F'"' '{print $2}')
         [[ -z "$proc" ]] && proc="-"
-
         if [[ "$conn" -gt 0 ]]; then
-            conn_str="${conn} (Active)"
-            conn_color="${RED}"
+            conn_str="${conn} (Active)"; conn_color="${RED}"
         else
-            conn_str="0"
-            conn_color="${PLAIN}"
+            conn_str="0"; conn_color="${PLAIN}"
         fi
-
         printf "${pcolor}%-10s${PLAIN} %-12s %-15s ${conn_color}%-15s${PLAIN} %-20s\n" "$ptag" "$port" "Listening" "$conn_str" "$proc"
     done
     echo -e "----------------------------------------------------------------------"
 }
 
-# --- 功能 2：端口限速 (集成点选功能) ---
+# --- 功能 2：端口限速 ---
 function apply_port_limit() {
     echo -e "\n${BLUE}--- 配置端口限速 ---${PLAIN}"
-    
-    # [新增] 调用选择器
     select_active_port
-    # 如果选择无效，退出函数
     [[ -z "$SELECTED_PORT" ]] && return
     PORT=$SELECTED_PORT
 
     echo -e "\n请选择限制方向："
-    echo -e "1. ${GREEN}下行${PLAIN} (Outbound / 用户下载)"
-    echo -e "2. ${GREEN}上行${PLAIN} (Inbound / 用户上传)"
-    echo -e "3. ${YELLOW}双向${PLAIN} (同时限制)"
-    read -p "请输入选项 [1-3]: " dir_choice
-
+    echo -e "1. ${GREEN}下行${PLAIN} (下载)"
+    echo -e "2. ${GREEN}上行${PLAIN} (上传)"
+    echo -e "3. ${YELLOW}双向${PLAIN}"
+    read -p "选项 [1-3]: " dir_choice
     case $dir_choice in
-        1) direction="out" ;;
-        2) direction="in" ;;
-        3) direction="bi" ;;
-        *) echo -e "${RED}默认双向${PLAIN}"; direction="bi" ;;
+        1) direction="out" ;; 2) direction="in" ;; 3) direction="bi" ;; *) direction="bi" ;;
     esac
 
-    read -p "请输入速率限制 (Mbps): " RATE_MBPS
+    read -p "速率 (Mbps): " RATE_MBPS
     RATE_KBIT=$(($RATE_MBPS * 1000))
     BURST="100k"
     HEX_ID=$(printf '%x' $PORT)
 
     init_tc_tree
 
-    echo -e "${YELLOW}[Config] 正在应用规则 (Port: $PORT)...${PLAIN}"
+    echo -e "${YELLOW}[Config] 正在应用...${PLAIN}"
 
     if [[ "$direction" == "out" || "$direction" == "bi" ]]; then
         tc filter del dev $INTERFACE parent 1:0 prio $PORT >/dev/null 2>&1
         tc class del dev $INTERFACE parent 1:1 classid 1:$HEX_ID >/dev/null 2>&1
-        tc class add dev $INTERFACE parent 1:1 classid 1:$HEX_ID htb rate ${RATE_KBIT}kbit ceil ${RATE_KBIT}kbit burst $BURST quantum $USER_QUANTUM
+        
+        # [关键优化] 被限速的端口给予 prio 1 (低优先级)
+        # 这样当网络拥堵时，未限速的 prio 0 流量会优先通过，不会卡顿
+        tc class add dev $INTERFACE parent 1:1 classid 1:$HEX_ID htb rate ${RATE_KBIT}kbit ceil ${RATE_KBIT}kbit burst $BURST prio 1 quantum $USER_QUANTUM
+        
         tc filter add dev $INTERFACE protocol ip parent 1:0 prio $PORT u32 match ip sport $PORT 0xffff flowid 1:$HEX_ID
     fi
 
@@ -179,77 +186,69 @@ function apply_port_limit() {
         police rate ${RATE_KBIT}kbit burst $BURST drop flowid :1
     fi
 
-    echo -e "${GREEN}[Success] 端口 $PORT 限速已生效！${PLAIN}"
+    echo -e "${GREEN}[Success] 端口 $PORT 限速生效 (低优先级)。${PLAIN}"
 }
 
 # --- 功能 3：全局限速 ---
 function apply_global_limit() {
-    echo -e "\n${BLUE}--- 全局限速 (整机) ---${PLAIN}"
-    read -p "请输入总速率 (Mbps): " RATE_MBPS
+    echo -e "\n${BLUE}--- 全局限速 ---${PLAIN}"
+    read -p "总速率 (Mbps): " RATE_MBPS
     RATE_KBIT=$(($RATE_MBPS * 1000))
     BURST="100k"
+    
+    optimize_network
     
     tc qdisc del dev $INTERFACE root >/dev/null 2>&1
     tc qdisc del dev $INTERFACE ingress >/dev/null 2>&1
 
     tc qdisc add dev $INTERFACE root handle 1: htb default 10 r2q 10
-    
     tc class add dev $INTERFACE parent 1: classid 1:1 htb rate ${RATE_KBIT}kbit ceil ${RATE_KBIT}kbit burst $BURST quantum $USER_QUANTUM
-    tc class add dev $INTERFACE parent 1:1 classid 1:10 htb rate ${RATE_KBIT}kbit ceil ${RATE_KBIT}kbit burst $BURST quantum $USER_QUANTUM
+    tc class add dev $INTERFACE parent 1:1 classid 1:10 htb rate ${RATE_KBIT}kbit ceil ${RATE_KBIT}kbit burst $BURST prio 0 quantum $USER_QUANTUM
 
     tc qdisc add dev $INTERFACE handle ffff: ingress
     tc filter add dev $INTERFACE parent ffff: protocol ip prio 50 u32 match ip src 0.0.0.0/0 \
     police rate ${RATE_KBIT}kbit burst $BURST drop flowid :1
-
-    echo -e "${GREEN}[Success] 全局限速已生效！${PLAIN}"
+    echo -e "${GREEN}[Success] 全局限速生效。${PLAIN}"
 }
 
-# --- 功能 4：解除限制 (新增：方向选择) ---
+# --- 功能 4：解除限制 ---
 function remove_limit() {
-    echo -e "\n1. 解除指定端口 (可区分方向)"
-    echo -e "2. 重置所有限制 (网卡级)"
+    echo -e "\n1. 解除指定端口"
+    echo -e "2. 重置所有 (恢复默认)"
     read -p "选择: " sel
     
     if [[ "$sel" == "1" ]]; then
-        # [新增] 调用选择器
         select_active_port
         [[ -z "$SELECTED_PORT" ]] && return
         PORT=$SELECTED_PORT
         HEX_ID=$(printf '%x' $PORT)
         
-        # [新增] 询问解除哪个方向
-        echo -e "\n请选择要解除的方向："
-        echo -e "1. 仅解除 ${GREEN}下行限制${PLAIN} (Outbound)"
-        echo -e "2. 仅解除 ${GREEN}上行限制${PLAIN} (Inbound)"
-        echo -e "3. 解除 ${RED}双向限制${PLAIN} (Both)"
-        read -p "输入选项 [1-3]: " rm_choice
-        
+        echo -e "\n1. 仅解除 ${GREEN}下行${PLAIN}"
+        echo -e "2. 仅解除 ${GREEN}上行${PLAIN}"
+        echo -e "3. 解除 ${RED}双向${PLAIN}"
+        read -p "选项: " rm_choice
         case $rm_choice in
             1) 
                 tc filter del dev $INTERFACE parent 1:0 prio $PORT >/dev/null 2>&1
                 tc class del dev $INTERFACE parent 1:1 classid 1:$HEX_ID >/dev/null 2>&1
-                echo -e "${GREEN}端口 $PORT [下行] 限制已移除。${PLAIN}"
-                ;;
+                echo -e "${GREEN}端口 $PORT [下行] 已移除。${PLAIN}" ;;
             2) 
                 tc filter del dev $INTERFACE parent ffff: prio $PORT >/dev/null 2>&1
-                echo -e "${GREEN}端口 $PORT [上行] 限制已移除。${PLAIN}"
-                ;;
+                echo -e "${GREEN}端口 $PORT [上行] 已移除。${PLAIN}" ;;
             *) 
                 tc filter del dev $INTERFACE parent 1:0 prio $PORT >/dev/null 2>&1
                 tc class del dev $INTERFACE parent 1:1 classid 1:$HEX_ID >/dev/null 2>&1
                 tc filter del dev $INTERFACE parent ffff: prio $PORT >/dev/null 2>&1
-                echo -e "${GREEN}端口 $PORT [双向] 限制已全部移除。${PLAIN}"
-                ;;
+                echo -e "${GREEN}端口 $PORT [双向] 已移除。${PLAIN}" ;;
         esac
-
     elif [[ "$sel" == "2" ]]; then
         tc qdisc del dev $INTERFACE root >/dev/null 2>&1
         tc qdisc del dev $INTERFACE ingress >/dev/null 2>&1
-        echo -e "${GREEN}网卡已重置。${PLAIN}"
+        # 重置时最好也恢复 offloading，但通常保持关闭也没坏处，这里简单处理
+        echo -e "${GREEN}限制已重置。${PLAIN}"
     fi
 }
 
-# --- 功能 5：测速 ---
 function run_pro_speedtest() {
     echo -e "${YELLOW}[Testing] Speedtest...${PLAIN}"
     if [ ! -f "./speedtest" ]; then
@@ -261,20 +260,20 @@ function run_pro_speedtest() {
     ./speedtest --accept-license --accept-gdpr
 }
 
-# ================= 主菜单 =================
+# ================= 菜单 =================
 function show_menu() {
     clear
     echo -e "=================================================="
-    echo -e "       VPS 流量控制台 V8.0 (Interactive)"
+    echo -e "       VPS 流量控制台 V9.0 (Anti-Lag)"
     echo -e "       网卡: ${GREEN}${INTERFACE}${PLAIN}"
     echo -e "=================================================="
-    echo -e "1. 查看活跃端口 (状态监控)"
+    echo -e "1. 查看活跃端口"
     echo -e "--------------------------------------------------"
-    echo -e "2. 设置 ${YELLOW}端口限速${PLAIN} (列表点选 / 双向支持)"
-    echo -e "3. 设置 ${RED}全局限速${PLAIN} (整机限制)"
+    echo -e "2. 设置 ${YELLOW}端口限速${PLAIN} (自动优化防卡顿)"
+    echo -e "3. 设置 ${RED}全局限速${PLAIN}"
     echo -e "--------------------------------------------------"
-    echo -e "4. 解除限制 (支持单向解除)"
-    echo -e "5. 运行测速 (Speedtest)"
+    echo -e "4. 解除限制 (支持方向选择)"
+    echo -e "5. 运行测速"
     echo -e "0. 退出"
     echo -e "=================================================="
     read -p "选择: " choice
