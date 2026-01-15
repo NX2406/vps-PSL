@@ -1,132 +1,169 @@
 #!/bin/bash
 
 # ==================================================
-# VPS 流量控制台 V5.0 (UI修复版)
-# 特性：完美对齐 | 无乱码 | 活跃连接深度分析 | 全局/端口限速
+# VPS 流量控制台 V6.0 (稳定修复版)
+# 修复：Hex进制转换 | 交互逻辑优化 | 乱码根除
 # ==================================================
 
-# --- 1. 颜色定义 (修复乱码核心：使用 ANSI C Quoting) ---
-# 这样定义后，printf 能够正确识别它们为控制符，而不是文字
-RED=$'\e[31m'
-GREEN=$'\e[32m'
-YELLOW=$'\e[33m'
-BLUE=$'\e[36m'
-PLAIN=$'\e[0m'
-BOLD=$'\e[1m'
+# 1. 基础设置与颜色 (最通用的写法，防止乱码)
+RED='\033[31m'
+GREEN='\033[32m'
+YELLOW='\033[33m'
+BLUE='\033[36m'
+PLAIN='\033[0m'
 
-# 检查 root 权限
-[[ $EUID -ne 0 ]] && echo -e "${RED}错误：${PLAIN} 必须使用 root 用户运行此脚本！\n" && exit 1
+# 检查 root
+[[ $EUID -ne 0 ]] && echo -e "${RED}错误：请使用 root 用户运行！${PLAIN}" && exit 1
 
-# 自动获取物理网卡名称
+# 获取网卡
 INTERFACE=$(ip route get 8.8.8.8 | awk '{print $5; exit}')
 
 # ================= 核心工具函数 =================
 
+# 初始化 TC 根队列 (增加 r2q 参数消除警告)
 function init_tc_tree() {
+    # 如果没有 root htb，则创建
     if ! tc qdisc show dev $INTERFACE | grep -q "htb"; then
-        tc qdisc add dev $INTERFACE root handle 1: htb default 10
+        # r2q 10 优化 Quantum 计算，防止 log 刷屏警告
+        tc qdisc add dev $INTERFACE root handle 1: htb default 10 r2q 10
     fi
+    # 建立总池 1:1
     if ! tc class show dev $INTERFACE | grep -q "1:1 "; then
         tc class add dev $INTERFACE parent 1: classid 1:1 htb rate 10000mbit
     fi
+    # 建立默认通道 1:10
     if ! tc class show dev $INTERFACE | grep -q "1:10 "; then
         tc class add dev $INTERFACE parent 1:1 classid 1:10 htb rate 10000mbit
     fi
+    # 建立 Ingress
     if ! tc qdisc show dev $INTERFACE | grep -q "ingress"; then
         tc qdisc add dev $INTERFACE handle ffff: ingress
     fi
 }
 
-# --- 功能 1：活跃端口扫描 (修复显示与对齐) ---
+# --- 功能 1：活跃端口扫描 (修复乱码与对齐) ---
 function check_port_status() {
     clear
-    echo -e "${YELLOW}[Scanning] 深度端口连接分析...${PLAIN}"
-    echo -e "----------------------------------------------------------------------------------"
-    # 使用 printf 进行严格的列对齐 (颜色代码放在 %s 之外，不影响宽度计算)
-    printf "${BOLD}%-10s %-12s %-15s %-15s %-20s${PLAIN}\n" "协议" "端口" "监听状态" "活跃连接数" "进程/服务"
-    echo -e "----------------------------------------------------------------------------------"
+    echo -e "${YELLOW}[Scanning] 活跃端口深度扫描...${PLAIN}"
+    echo -e "----------------------------------------------------------------------"
+    # 打印表头
+    printf "%-10s %-12s %-15s %-15s %-20s\n" "协议" "端口" "状态" "活跃连接数" "进程名"
+    echo -e "----------------------------------------------------------------------"
 
-    # 获取所有监听端口
-    # 格式化输出: Proto, Local-Address, Process
+    # 扫描
     ss -tulpn | grep LISTEN | awk '{print $1, $5, $7}' | while read -r proto address process; do
-        
-        # 提取端口号
         port=$(echo "$address" | awk -F':' '{print $NF}')
         
-        # 1. 处理协议显示颜色
+        # 统计连接数
         if [[ "$proto" == "tcp" ]]; then
-            proto_display="${GREEN}TCP${PLAIN}"
+            # 颜色变量不放入 printf 长度计算，防止对齐错乱
+            ptag="TCP"
+            pcolor="${GREEN}"
+            # 统计 Established 连接
+            conn=$(ss -tn state established | awk '{print $4}' | grep -w ":$port" | wc -l)
         else
-            proto_display="${BLUE}UDP${PLAIN}"
+            ptag="UDP"
+            pcolor="${BLUE}"
+            conn=$(ss -un | awk '{print $4}' | grep -w ":$port" | wc -l)
         fi
 
-        # 2. 统计活跃连接 (ESTABLISHED)
-        # 只有真正建立的数据传输连接才算活跃，排除监听本身
-        if [[ "$proto" == "tcp" ]]; then
-            # 精确匹配 :端口号 的已建立连接
-            conn_count=$(ss -tn state established | awk '{print $4}' | grep -w ":$port" | wc -l)
+        # 进程名提取
+        proc=$(echo "$process" | awk -F'"' '{print $2}')
+        [[ -z "$proc" ]] && proc="-"
+
+        # 活跃状态高亮
+        if [[ "$conn" -gt 0 ]]; then
+            conn_str="${conn} (Active)"
+            conn_color="${RED}"
         else
-            conn_count=$(ss -un | awk '{print $4}' | grep -w ":$port" | wc -l)
+            conn_str="0"
+            conn_color="${PLAIN}"
         fi
 
-        # 3. 处理活跃度显示颜色
-        if [[ "$conn_count" -gt 0 ]]; then
-            conn_display="${RED}${conn_count} (Active)${PLAIN}"
-        else
-            conn_display="${PLAIN}0 (Idle)"
-        fi
-
-        # 4. 提取进程名
-        proc_name=$(echo "$process" | awk -F'"' '{print $2}')
-        [[ -z "$proc_name" ]] && proc_name="未知"
-
-        # 5. 打印一行 (注意：颜色代码放在参数里，调整 printf 宽度以适应颜色代码长度，或者分段打印)
-        # 为了完美对齐，我们将颜色剥离出 printf 的宽度计算逻辑
-        # 这里使用一种 trick：printf 打印纯文本占位，颜色手动插入
-        
-        printf "%-18b %-12s %-15s %-25b %-20s\n" "${proto_display}" "${port}" "Listening" "${conn_display}" "${proc_name}"
+        # 打印行：先打印颜色代码，再打印占位符，最后重置颜色
+        # 这种写法能保证列宽对齐不受颜色代码字符长度影响
+        printf "${pcolor}%-10s${PLAIN} %-12s %-15s ${conn_color}%-15s${PLAIN} %-20s\n" "$ptag" "$port" "Listening" "$conn_str" "$proc"
     done
-    echo -e "----------------------------------------------------------------------------------"
-    echo -e "${PLAIN}说明：'活跃连接数' 指当前正在传输数据的连接 (Established)。${PLAIN}"
+    echo -e "----------------------------------------------------------------------"
 }
 
-# --- 功能 2：端口限速 ---
+# --- 功能 2：端口限速 (修复 ClassID 报错 & 增加交互) ---
 function apply_port_limit() {
-    local direction=$1
-    echo -e "\n${BLUE}--- 配置端口限速 ($direction) ---${PLAIN}"
-    read -p "请输入端口号: " PORT
-    read -p "请输入速率 (Mbps): " RATE_MBPS
+    echo -e "\n${BLUE}--- 配置端口限速 ---${PLAIN}"
     
-    RATE_KBIT=$(($RATE_MBPS * 1000))
-    BURST="100k"
-    init_tc_tree
-
-    if [[ "$direction" == "out" || "$direction" == "bi" ]]; then
-        tc filter del dev $INTERFACE parent 1:0 prio $PORT >/dev/null 2>&1
-        tc class del dev $INTERFACE parent 1:1 classid 1:$PORT >/dev/null 2>&1
-        tc class add dev $INTERFACE parent 1:1 classid 1:$PORT htb rate ${RATE_KBIT}kbit ceil ${RATE_KBIT}kbit burst $BURST
-        tc filter add dev $INTERFACE protocol ip parent 1:0 prio $PORT u32 match ip sport $PORT 0xffff flowid 1:$PORT
+    # 1. 输入端口
+    read -p "请输入端口号: " PORT
+    # 简单的数字检查
+    if ! [[ "$PORT" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}错误：端口必须是数字！${PLAIN}"
+        return
     fi
 
+    # 2. 询问方向 (满足你的需求)
+    echo -e "请选择限制方向："
+    echo -e "1. ${GREEN}下行${PLAIN} (Outbound / 用户下载速度)"
+    echo -e "2. ${GREEN}上行${PLAIN} (Inbound / 用户上传速度)"
+    echo -e "3. ${YELLOW}双向${PLAIN} (同时限制)"
+    read -p "请输入选项 [1-3]: " dir_choice
+
+    case $dir_choice in
+        1) direction="out" ;;
+        2) direction="in" ;;
+        3) direction="bi" ;;
+        *) echo -e "${RED}无效选项，默认双向${PLAIN}"; direction="bi" ;;
+    esac
+
+    # 3. 输入速率
+    read -p "请输入速率限制 (Mbps): " RATE_MBPS
+    RATE_KBIT=$(($RATE_MBPS * 1000))
+    BURST="100k"
+
+    # 4. [关键修复] 将十进制端口转换为十六进制 Class ID
+    # tc classid 需要 hex，例如 端口 42843 -> a75b
+    HEX_ID=$(printf '%x' $PORT)
+
+    init_tc_tree
+
+    echo -e "${YELLOW}[Config] 正在应用规则 (Port: $PORT / Hex: $HEX_ID)...${PLAIN}"
+
+    # --- 下行逻辑 ---
+    if [[ "$direction" == "out" || "$direction" == "bi" ]]; then
+        # 清理旧规则 (使用 hex id)
+        tc filter del dev $INTERFACE parent 1:0 prio $PORT >/dev/null 2>&1
+        tc class del dev $INTERFACE parent 1:1 classid 1:$HEX_ID >/dev/null 2>&1
+        
+        # 添加新规则 (使用 hex id)
+        tc class add dev $INTERFACE parent 1:1 classid 1:$HEX_ID htb rate ${RATE_KBIT}kbit ceil ${RATE_KBIT}kbit burst $BURST
+        # filter prio 依然使用十进制即可，但 classid 必须是 hex
+        tc filter add dev $INTERFACE protocol ip parent 1:0 prio $PORT u32 match ip sport $PORT 0xffff flowid 1:$HEX_ID
+    fi
+
+    # --- 上行逻辑 ---
     if [[ "$direction" == "in" || "$direction" == "bi" ]]; then
+        # 清理旧规则
         tc filter del dev $INTERFACE parent ffff: prio $PORT >/dev/null 2>&1
+        
+        # 添加新规则 (ingress 不需要 classid，直接 police)
         tc filter add dev $INTERFACE parent ffff: protocol ip prio $PORT u32 match ip dport $PORT 0xffff \
         police rate ${RATE_KBIT}kbit burst $BURST drop flowid :1
     fi
-    echo -e "${GREEN}[Success] 端口 $PORT 限速已生效！${PLAIN}"
+
+    echo -e "${GREEN}[Success] 端口 $PORT 限速已生效！模式: $direction | 速率: ${RATE_MBPS}Mbps${PLAIN}"
 }
 
 # --- 功能 3：全局限速 ---
 function apply_global_limit() {
     echo -e "\n${BLUE}--- 全局限速 (整机) ---${PLAIN}"
-    read -p "请输入总速率限制 (Mbps): " RATE_MBPS
+    read -p "请输入总速率 (Mbps): " RATE_MBPS
     RATE_KBIT=$(($RATE_MBPS * 1000))
     BURST="100k"
     
+    # 暴力重置
     tc qdisc del dev $INTERFACE root >/dev/null 2>&1
     tc qdisc del dev $INTERFACE ingress >/dev/null 2>&1
 
-    tc qdisc add dev $INTERFACE root handle 1: htb default 10
+    tc qdisc add dev $INTERFACE root handle 1: htb default 10 r2q 10
+    # 直接限制父类 1:1
     tc class add dev $INTERFACE parent 1: classid 1:1 htb rate ${RATE_KBIT}kbit ceil ${RATE_KBIT}kbit burst $BURST
     tc class add dev $INTERFACE parent 1:1 classid 1:10 htb rate ${RATE_KBIT}kbit ceil ${RATE_KBIT}kbit burst $BURST
 
@@ -144,10 +181,13 @@ function remove_limit() {
     read -p "选择: " sel
     if [[ "$sel" == "1" ]]; then
         read -p "端口号: " PORT
+        # 同样需要转 hex 才能删除 class
+        HEX_ID=$(printf '%x' $PORT)
+        
         tc filter del dev $INTERFACE parent 1:0 prio $PORT >/dev/null 2>&1
-        tc class del dev $INTERFACE parent 1:1 classid 1:$PORT >/dev/null 2>&1
+        tc class del dev $INTERFACE parent 1:1 classid 1:$HEX_ID >/dev/null 2>&1
         tc filter del dev $INTERFACE parent ffff: prio $PORT >/dev/null 2>&1
-        echo -e "${GREEN}端口 $PORT 已解除。${PLAIN}"
+        echo -e "${GREEN}端口 $PORT 规则已尝试移除。${PLAIN}"
     elif [[ "$sel" == "2" ]]; then
         tc qdisc del dev $INTERFACE root >/dev/null 2>&1
         tc qdisc del dev $INTERFACE ingress >/dev/null 2>&1
@@ -157,7 +197,7 @@ function remove_limit() {
 
 # --- 功能 5：测速 ---
 function run_pro_speedtest() {
-    echo -e "${YELLOW}[Check] 正在调用 Speedtest...${PLAIN}"
+    echo -e "${YELLOW}[Testing] Speedtest...${PLAIN}"
     if [ ! -f "./speedtest" ]; then
         ARCH=$(uname -m)
         [[ "$ARCH" == "x86_64" ]] && URL="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz"
@@ -171,12 +211,12 @@ function run_pro_speedtest() {
 function show_menu() {
     clear
     echo -e "=================================================="
-    echo -e "       VPS 流量控制台 V5.0 (UI修复版)"
+    echo -e "       VPS 流量控制台 V6.0 (Stable)"
     echo -e "       网卡: ${GREEN}${INTERFACE}${PLAIN}"
     echo -e "=================================================="
-    echo -e "1. 查看活跃端口 (无乱码/详细)"
+    echo -e "1. 查看活跃端口"
     echo -e "--------------------------------------------------"
-    echo -e "2. 设置 ${YELLOW}指定端口${PLAIN} 限速"
+    echo -e "2. 设置 ${YELLOW}指定端口${PLAIN} 限速 (支持单/双向)"
     echo -e "3. 设置 ${RED}全局网卡${PLAIN} 限速"
     echo -e "--------------------------------------------------"
     echo -e "4. 解除限制"
@@ -187,7 +227,7 @@ function show_menu() {
 
     case $choice in
         1) check_port_status; read -p "回车返回..." ;;
-        2) apply_port_limit "bi"; read -p "回车返回..." ;;
+        2) apply_port_limit; read -p "回车返回..." ;; # 去掉了参数，在内部询问
         3) apply_global_limit; read -p "回车返回..." ;;
         4) remove_limit; read -p "回车返回..." ;;
         5) run_pro_speedtest; read -p "回车返回..." ;;
