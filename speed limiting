@@ -1,10 +1,6 @@
 #!/bin/bash
 # ==================================================
-# VPS 流量控制台 V10.3 (3x-ui / Xray + Per-Port Shaping, FIXED IDs)
-#
-# 修复点：
-# - 彻底修复 classid/handle 溢出导致的 “创建 TBF 失败”
-# - class minor 统一由分配器生成（<= 0xfffd），并写入清单，避免冲突/溢出
+# VPS 流量控制台 V10.4 (3x-ui / Xray + Per-Port Shaping + UI-like Speedtest)
 #
 # 功能：
 # 1) 监听目前所有端口（TCP/UDP，支持编号点选）
@@ -13,8 +9,12 @@
 # 4) 查看当前所有端口/项目的限速情况（清单）
 # 5) 移除 Xray 的限速（入站/出站）
 # 6) 全部重置（恢复脚本修改的所有项目）
-# 7) Speedtest（可指定端口；固定 500MB；上下行分开+进度条）
+# 7) Speedtest（指定端口；固定 500MB；上下行分开；“更像测速UI”的进度显示）
 # 0) 退出
+#
+# 关键修复：
+# - 修复 classid/handle 溢出导致的 “创建 TBF 失败”：改用 minor 分配器，保证 <= fffd
+# - Speedtest：保留进度输出（stderr），耗时写临时文件避免破坏进度显示
 # ==================================================
 
 set -u
@@ -27,7 +27,7 @@ PLAIN='\033[0m'
 
 [[ ${EUID:-999} -ne 0 ]] && echo -e "${RED}错误：请使用 root 用户运行！${PLAIN}" && exit 1
 
-for cmd in ip tc ss awk sed grep cut tr uname date mkdir mv rm modprobe ps id curl head wc; do
+for cmd in ip tc ss awk sed grep cut tr uname date mkdir mv rm modprobe ps id curl head wc mktemp cat; do
   command -v "$cmd" >/dev/null 2>&1 || { echo -e "${RED}缺少命令: $cmd${PLAIN}"; exit 1; }
 done
 
@@ -58,7 +58,7 @@ XRAY_IN_CLASSID="1:201"
 
 # state db
 STATE_DIR="/var/lib/vps-tc"
-DB_FILE="${STATE_DIR}/limits.db"
+DB_FILE="${STATE_DIR}/limits.db"   # type|key|dir|mbps|ts|meta
 mkdir -p "$STATE_DIR" >/dev/null 2>&1 || true
 touch "$DB_FILE" >/dev/null 2>&1 || true
 
@@ -73,37 +73,32 @@ is_number(){ [[ "$1" =~ ^[0-9]+$ ]]; }
 
 try_modprobe(){ modprobe "$1" >/dev/null 2>&1 || true; }
 
-# 失败时把 stderr 也打印出来（便于你定位）
+# 打印 stderr 以便定位（tc 常见失败点）
 run_or_fail(){
   local msg="$1"; shift
   local err
   err="$("$@" 2>&1 >/dev/null)" || {
     echo -e "${RED}[FAIL]${PLAIN} $msg"
-    [[ -n "$err" ]] && echo -e "${YELLOW}tc 输出:${PLAIN} $err"
+    [[ -n "$err" ]] && echo -e "${YELLOW}输出:${PLAIN} $err"
     return 1
   }
   return 0
 }
 
-# DB 格式：type|key|dir|mbps|ts|meta
-# meta 用于记录 class minor 等信息（比如 minor=abcd）
+# DB
 db_upsert(){
   local type="$1" key="$2" dir="$3" mbps="$4" meta="$5"
   local ts; ts="$(date +%F_%T)"
-  grep -vE "^${type}\|${key}\|${dir}\|" "$DB_FILE" > "${DB_FILE}.tmp" 2>/dev/null || true
+  grep -vE "^${type}\|${key}\|${dir}\|" "$DB_FILE" > "${DB_FILE}.tmp" 2>/dev.glide || true
   mv -f "${DB_FILE}.tmp" "$DB_FILE" >/dev/null 2>&1 || true
   echo "${type}|${key}|${dir}|${mbps}|${ts}|${meta}" >> "$DB_FILE"
 }
-
 db_delete_prefix(){
-  # 删除所有匹配 type|key 的行（用于 XRAY）
   local type="$1" key="$2"
   grep -vE "^${type}\|${key}\|" "$DB_FILE" > "${DB_FILE}.tmp" 2>/dev/null || true
   mv -f "${DB_FILE}.tmp" "$DB_FILE" >/dev/null 2>&1 || true
 }
-
 db_delete_exact(){
-  # 删除 type|key|dir 精确行（用于 PORT in/out）
   local type="$1" key="$2" dir="$3"
   grep -vE "^${type}\|${key}\|${dir}\|" "$DB_FILE" > "${DB_FILE}.tmp" 2>/dev/null || true
   mv -f "${DB_FILE}.tmp" "$DB_FILE" >/dev/null 2>&1 || true
@@ -187,60 +182,49 @@ init_all(){
 
 attach_precise_leaf(){
   local dev="$1" classid="$2" handle_major_hex="$3" rate_kbit="$4"
-
   local burst_bytes=$(( rate_kbit * 25 / 10 ))
   [[ "$burst_bytes" -lt "$TBF_MIN_BURST_BYTES" ]] && burst_bytes="$TBF_MIN_BURST_BYTES"
   local latency="${TBF_LATENCY_MS}ms"
 
-  # handle major 必须 <= ffff
   local tbf_handle="${handle_major_hex}:"
   local inner_parent="${handle_major_hex}:1"
 
   tc qdisc del dev "$dev" parent "$classid" >/dev/null 2>&1 || true
-
   run_or_fail "在 $dev/$classid 创建 TBF 失败" tc qdisc add dev "$dev" parent "$classid" handle "$tbf_handle" tbf \
     rate "${rate_kbit}kbit" burst "${burst_bytes}" latency "$latency" || return 1
-
   tc qdisc replace dev "$dev" parent "$inner_parent" handle "${handle_major_hex}f:" fq_codel >/dev/null 2>&1 || true
   return 0
 }
 
 # ==================================================
-# ID allocator (FIX for overflow)
+# ID allocator (fix overflow)
 # ==================================================
-# 为 PORT|<port>|<dir> 分配一个 <= fffd 的 minor，并避免与现有 PORT 规则冲突
-# 策略：从 seed=1000+(port%50000) 开始线性探测，直到找到未被占用的 minor
 minor_in_use(){
   local minor_hex="$1"
-  grep -E "^\s*PORT\|.*\|.*\|.*\|.*\|minor=${minor_hex}\s*$" -n "$DB_FILE" >/dev/null 2>&1
+  grep -E "minor=${minor_hex}\s*$" "$DB_FILE" >/dev/null 2>&1
 }
 
 alloc_minor_for_port(){
-  local port="$1" dir="$2"
+  local port="$1"
   local start=$((1000 + (port % 50000)))
   local m="$start"
   local tries=0
-
   while [[ "$tries" -lt 60000 ]]; do
-    # 预留 fffe 给 default，fffd 作为上限
-    if [[ "$m" -ge 65533 ]]; then m=1000; fi
+    [[ "$m" -ge 65533 ]] && m=1000
     local hex; hex="$(printf '%x' "$m")"
-
     if ! minor_in_use "$hex"; then
       echo "$hex"
       return 0
     fi
-
     m=$((m+1))
     tries=$((tries+1))
   done
-
   echo ""
   return 1
 }
 
 # ==================================================
-# 1) Listening ports with numeric selection (KEEP)
+# 1) Listening ports (keep numeric selection)
 # ==================================================
 select_active_port(){
   echo -e "${YELLOW}[List] 正在扫描监听端口(TCP/UDP)...${PLAIN}"
@@ -304,7 +288,7 @@ menu_list_ports(){
 }
 
 # ==================================================
-# 2) Xray total limit (out/in/both)
+# 2) Xray total limit
 # ==================================================
 detect_xray_uid(){
   local uid=""
@@ -352,7 +336,7 @@ apply_xray_out_limit(){
   ensure_nft_mark_rule "$uid" || return 1
 
   local rate_kbit=$((mbps * 1000))
-  local handle_hex="0200"   # <= ffff
+  local handle_hex="0200"
 
   tc filter del dev "$INTERFACE" parent 1:0 protocol all prio 10 >/dev/null 2>&1 || true
   tc qdisc  del dev "$INTERFACE" parent "$XRAY_OUT_CLASSID" >/dev/null 2>&1 || true
@@ -380,7 +364,7 @@ apply_xray_in_limit(){
   echo -e "${YELLOW}端口列表：${PLAIN} $(echo "$ports" | tr '\n' ' ')"
 
   local rate_kbit=$((mbps * 1000))
-  local handle_hex="0201"   # <= ffff
+  local handle_hex="0201"
 
   tc qdisc del dev "$IFB_DEV" parent "$XRAY_IN_CLASSID" >/dev/null 2>&1 || true
   tc class del dev "$IFB_DEV" parent 1:1 classid "$XRAY_IN_CLASSID" >/dev/null 2>&1 || true
@@ -436,42 +420,37 @@ menu_set_xray_limits(){
 }
 
 # ==================================================
-# 3) Per-port shaping (split in/out)  <-- FIXED IDs
+# 3) Per-port shaping (split in/out)
 # ==================================================
 apply_port_limit_one(){
   local port="$1" dir="$2" mbps="$3"
   local rate_kbit=$((mbps * 1000))
 
-  # 分配一个合法 minor (<= fffd)，并用于 classid 与 handle major
   local minor_hex
-  minor_hex="$(alloc_minor_for_port "$port" "$dir")"
+  minor_hex="$(alloc_minor_for_port "$port")"
   if [[ -z "$minor_hex" ]]; then
     echo -e "${RED}[FAIL]${PLAIN} 无法为端口 ${port} 分配 classid（minor 池耗尽）"
     return 1
   fi
 
   local classid="1:${minor_hex}"
-  local handle_hex="$minor_hex"   # <= fffd，合法
+  local handle_hex="$minor_hex"
 
   if [[ "$dir" == "out" ]]; then
-    # 清旧（基于 prio=port + 旧 classid 不可知，所以只清 prio filters；class 用 replace 覆盖）
     tc filter del dev "$INTERFACE" parent 1:0 protocol ip prio "$port" >/dev/null 2>&1 || true
     tc filter del dev "$INTERFACE" parent 1:0 protocol ipv6 prio "$port" >/dev/null 2>&1 || true
-
-    # 覆盖创建 class
     tc class del dev "$INTERFACE" parent 1:1 classid "$classid" >/dev/null 2>&1 || true
+
     run_or_fail "创建端口出站 class 失败" tc class add dev "$INTERFACE" parent 1:1 classid "$classid" htb \
       rate "${rate_kbit}kbit" ceil "${rate_kbit}kbit" burst "$HTB_BURST" quantum "$USER_QUANTUM" || return 1
 
     attach_precise_leaf "$INTERFACE" "$classid" "$handle_hex" "$rate_kbit" || return 1
 
-    # IPv4：TCP/UDP sport
     run_or_fail "添加 IPv4 出站 sport(TCP) 失败" tc filter add dev "$INTERFACE" parent 1:0 protocol ip prio "$port" u32 \
       match ip protocol 6 0xff match ip sport "$port" 0xffff flowid "$classid" || return 1
     tc filter add dev "$INTERFACE" parent 1:0 protocol ip prio "$port" u32 \
       match ip protocol 17 0xff match ip sport "$port" 0xffff flowid "$classid" >/dev/null 2>&1 || true
 
-    # IPv6：flower 才能精确
     if has_flower; then
       tc filter add dev "$INTERFACE" parent 1:0 protocol ipv6 prio "$port" flower ip_proto tcp src_port "$port" flowid "$classid" >/dev/null 2>&1 || true
       tc filter add dev "$INTERFACE" parent 1:0 protocol ipv6 prio "$port" flower ip_proto udp src_port "$port" flowid "$classid" >/dev/null 2>&1 || true
@@ -487,18 +466,16 @@ apply_port_limit_one(){
   if [[ "$dir" == "in" ]]; then
     tc filter del dev "$IFB_DEV" parent 1:0 protocol ip prio "$port" >/dev/null 2>&1 || true
     tc filter del dev "$IFB_DEV" parent 1:0 protocol ipv6 prio "$port" >/dev/null 2>&1 || true
-
     tc class del dev "$IFB_DEV" parent 1:1 classid "$classid" >/dev/null 2>&1 || true
+
     run_or_fail "创建端口入站 class 失败" tc class add dev "$IFB_DEV" parent 1:1 classid "$classid" htb \
       rate "${rate_kbit}kbit" ceil "${rate_kbit}kbit" burst "$HTB_BURST" quantum "$USER_QUANTUM" || return 1
 
     attach_precise_leaf "$IFB_DEV" "$classid" "$handle_hex" "$rate_kbit" || return 1
 
-    # IPv4：dport
     run_or_fail "添加 IPv4 入站 dport 失败" tc filter add dev "$IFB_DEV" parent 1:0 protocol ip prio "$port" u32 \
       match ip dport "$port" 0xffff flowid "$classid" || return 1
 
-    # IPv6：flower 才能精确
     if has_flower; then
       tc filter add dev "$IFB_DEV" parent 1:0 protocol ipv6 prio "$port" flower ip_proto tcp dst_port "$port" flowid "$classid" >/dev/null 2>&1 || true
       tc filter add dev "$IFB_DEV" parent 1:0 protocol ipv6 prio "$port" flower ip_proto udp dst_port "$port" flowid "$classid" >/dev/null 2>&1 || true
@@ -521,8 +498,8 @@ menu_port_limit(){
   local port="$SELECTED_PORT"
 
   echo -e "\n选择方向："
-  echo -e "1) 仅限制 ${GREEN}出站/下行${PLAIN}（用户下载，物理网卡 egress）"
-  echo -e "2) 仅限制 ${GREEN}入站/上行${PLAIN}（用户上传，IFB 入方向整形）"
+  echo -e "1) 仅限制 ${GREEN}出站/下行${PLAIN}"
+  echo -e "2) 仅限制 ${GREEN}入站/上行${PLAIN}"
   echo -e "3) 同时限制 ${YELLOW}入站+出站${PLAIN}"
   read -p "选择[1-3]: " sel
 
@@ -543,7 +520,7 @@ menu_port_limit(){
 }
 
 # ==================================================
-# 4) Show limits (DB)
+# 4) Show limits
 # ==================================================
 show_limits(){
   clear
@@ -615,7 +592,7 @@ reset_all(){
 }
 
 # ==================================================
-# 7) Speedtest (fixed 500MB) + progress bars
+# 7) Speedtest UI-like (fixed 500MB, progress)
 # ==================================================
 calc_mbps(){
   local bytes="$1" sec="$2"
@@ -623,7 +600,7 @@ calc_mbps(){
 }
 
 speedtest_fixed_500mb(){
-  echo -e "\n${BLUE}--- Speedtest（固定 500MB，上下行分开，进度条）---${PLAIN}"
+  echo -e "\n${BLUE}--- Speedtest（固定 500MB，上下行分开，“测速UI”风格进度）---${PLAIN}"
   read -p "测试主机(默认 speed.cloudflare.com): " host
   [[ -z "$host" ]] && host="speed.cloudflare.com"
 
@@ -640,22 +617,25 @@ speedtest_fixed_500mb(){
   local down_url="${scheme}://${host}:${port}/__down?bytes=${SPEEDTEST_BYTES}"
   local up_url="${scheme}://${host}:${port}/__up"
 
+  local dtmp utmp
+  dtmp="$(mktemp /tmp/vps-tc-dl.XXXXXX)"
+  utmp="$(mktemp /tmp/vps-tc-ul.XXXXXX)"
+
   echo -e "${YELLOW}下载测试中...${PLAIN} (${SPEEDTEST_MB}MB via ${host}:${port})"
-  local dtime
-  dtime="$(curl -# -o /dev/null --connect-timeout 8 --max-time 300 -w "%{time_total}" "$down_url" 2>/dev/null)"
-  local dMbps
-  dMbps="$(calc_mbps "$SPEEDTEST_BYTES" "$dtime")"
+  # UI-like：用 --progress-bar（比 -# 信息更完整），进度走 stderr（必须保留）
+  curl --progress-bar -o /dev/null --connect-timeout 8 --max-time 600 -w "%{time_total}" "$down_url" >"$dtmp"
+  local dtime; dtime="$(cat "$dtmp" 2>/dev/null)"
+  rm -f "$dtmp" >/dev/null 2>&1 || true
+  local dMbps; dMbps="$(calc_mbps "$SPEEDTEST_BYTES" "$dtime")"
   echo -e "${GREEN}Download:${PLAIN} ${dMbps} Mbps  (耗时 ${dtime}s)"
 
   echo -e "${YELLOW}上传测试中...${PLAIN} (${SPEEDTEST_MB}MB via ${host}:${port})"
-  local utime
-  utime="$(
-    head -c "$SPEEDTEST_BYTES" </dev/zero | \
-    curl -# -o /dev/null --connect-timeout 8 --max-time 300 -w "%{time_total}" \
-      -X POST --data-binary @- "$up_url" 2>/dev/null
-  )"
-  local uMbps
-  uMbps="$(calc_mbps "$SPEEDTEST_BYTES" "$utime")"
+  head -c "$SPEEDTEST_BYTES" </dev/zero | \
+    curl --progress-bar -o /dev/null --connect-timeout 8 --max-time 600 -w "%{time_total}" \
+      -X POST --data-binary @- "$up_url" >"$utmp"
+  local utime; utime="$(cat "$utmp" 2>/dev/null)"
+  rm -f "$utmp" >/dev/null 2>&1 || true
+  local uMbps; uMbps="$(calc_mbps "$SPEEDTEST_BYTES" "$utime")"
   echo -e "${GREEN}Upload:${PLAIN}   ${uMbps} Mbps  (耗时 ${utime}s)"
 }
 
@@ -665,7 +645,7 @@ speedtest_fixed_500mb(){
 show_menu(){
   clear
   echo -e "=================================================="
-  echo -e "   VPS 流量控制台 V10.3（修复 TBF 失败版）"
+  echo -e "   VPS 流量控制台 V10.4（端口限速+测速UI进度）"
   echo -e "   网卡: ${GREEN}${INTERFACE}${PLAIN} | IFB: ${GREEN}${IFB_DEV}${PLAIN}"
   echo -e "   nftables: $(has_nft && echo -e "${GREEN}OK${PLAIN}" || echo -e "${YELLOW}缺失(建议安装)${PLAIN}")"
   echo -e "=================================================="
@@ -675,7 +655,7 @@ show_menu(){
   echo -e "4. 查看当前所有端口/项目的限速情况（清单）"
   echo -e "5. 移除 Xray 的限速（入站/出站）"
   echo -e "6. 全部重置（恢复脚本修改的所有项目）"
-  echo -e "7. Speedtest 测速（指定端口，固定 500MB，上下行分开+进度条）"
+  echo -e "7. Speedtest 测速（指定端口；固定 500MB；上下行分开；进度条）"
   echo -e "0. 退出"
   echo -e "=================================================="
   read -p "选择: " c
