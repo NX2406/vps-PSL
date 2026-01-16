@@ -1,24 +1,22 @@
 #!/bin/bash
 # ==================================================
-# VPS 流量控制台 V10.7 (Xray + Per-Port + Real-time Monitor + Ookla)
+# VPS 流量控制台 V10.9 (Final Stable)
 #
-# 功能：
-# 1) 监听目前所有端口 (列表展示)
-# 2) 限制 Xray 总出站/总入站速度（支持 Docker/手动 UID）
-# 3) 限制 特定端口 速率（上下行可分开设置）
-# 4) 查看当前所有端口/项目的限速情况（清单）
-# 5) 移除 Xray 的限速（入站/出站）
-# 6) 全部重置（恢复脚本修改的所有项目）
-# 7) Speedtest by Ookla (美化版，支持指定服务器，自动 Fallback 安装)
-# 8) 实时流量与丢包监控 (Live Monitor)
-# 9) 彻底卸载 (清理所有配置和残留)
-# 0) 退出
+# 功能全集：
+# 1) 端口监听列表 (纯展示)
+# 2) Xray 限速 (支持 Docker/手动 UID 录入)
+# 3) 特定端口限速 (支持手动输入端口，上下行独立)
+# 4) 限速清单查看
+# 5) 移除 Xray 限速
+# 6) 全部重置
+# 7) Speedtest by Ookla (官方版，支持选节点)
+# 8) 实时流量监控 (修复乱码，原地刷新，回车返回)
+# 9) 彻底卸载
 #
-# 更新日志 V10.7:
-# - [新增] 实时监控面板 (Menu 8)
-# - [新增] 卸载功能 (Menu 9)
-# - [优化] Xray 限速：支持手动输入 UID (兼容 Docker)
-# - [优化] Speedtest：增加二进制包下载兜底，优化界面输出，支持选节点
+# 修改记录 V10.9:
+# - [修复] 监控面板乱码问题 (ANSI 颜色代码解析)
+# - [优化] 监控面板改为 tput 原地刷新，杜绝滚屏
+# - [优化] 监控面板数值显示单位 (K/M/G 自动转换)
 # ==================================================
 
 set -u
@@ -231,7 +229,6 @@ ensure_nft_mark_rule(){
   fi
   # 检查是否已存在该UID规则
   if nft list chain inet "$NFT_TABLE" "$NFT_CHAIN" 2>/dev/null | grep -q "meta skuid .* meta mark set ${XRAY_MARK_DEC}"; then
-    # 如果已存在但UID不同，这里暂不处理复杂替换，假设用户只有一个xray实例
     return 0
   fi
   run_or_fail "nft add rule" nft add rule inet "$NFT_TABLE" "$NFT_CHAIN" meta skuid "$uid" meta mark set "$XRAY_MARK_DEC" || return 1
@@ -242,7 +239,6 @@ apply_xray_out_limit(){
   local mbps="$1"
   local uid; uid="$(detect_xray_uid_auto)"
   
-  # 优化：如果找不到UID，询问用户
   if [[ -z "$uid" ]]; then
     echo -e "${YELLOW}警告：未能自动检测到 Xray 进程 UID。${PLAIN}"
     echo -e "如果你正在使用 ${CYAN}Docker${PLAIN}，或者进程名不是 xray，请输入容器映射在宿主机的 UID。"
@@ -450,7 +446,6 @@ install_ookla_speedtest(){
   echo -e "${YELLOW}检测到未安装 speedtest，正在安装...${PLAIN}"
   local installed=0
   
-  # 1. 尝试官方源
   if [ -f /etc/debian_version ]; then
     curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash >/dev/null 2>&1
     apt-get update >/dev/null 2>&1 && apt-get install -y speedtest >/dev/null 2>&1 && installed=1
@@ -459,7 +454,6 @@ install_ookla_speedtest(){
     yum install -y speedtest >/dev/null 2>&1 && installed=1
   fi
 
-  # 2. 如果源安装失败，尝试二进制下载 (Fallback)
   if [[ "$installed" -eq 0 ]]; then
     echo -e "${YELLOW}源安装失败，尝试下载二进制包...${PLAIN}"
     local arch; arch=$(uname -m)
@@ -488,18 +482,13 @@ install_ookla_speedtest(){
 
 run_ookla_speedtest(){
   if ! command -v speedtest >/dev/null 2>&1; then install_ookla_speedtest || return; fi
-  
   echo -e "\n${BLUE}========== Speedtest by Ookla ==========${PLAIN}"
-  echo -e "你可以直接回车使用自动节点，或输入 Server ID 指定节点。"
+  echo -e "回车使用自动节点，或输入 Server ID 指定节点。"
   read -p "Server ID (可选): " sid
-
-  # 首次运行自动接受协议
   if [[ ! -f ~/.config/ookla/speedtest-cli.json ]]; then
     speedtest --accept-license --accept-gdpr >/dev/null 2>&1
   fi
-
-  echo -e "${CYAN}正在启动测速引擎...${PLAIN}\n"
-  
+  echo -e "${CYAN}启动测速...${PLAIN}\n"
   if [[ -n "$sid" ]]; then
     speedtest --server-id="$sid" --progress=yes
   else
@@ -508,25 +497,28 @@ run_ookla_speedtest(){
   echo -e "${BLUE}========================================${PLAIN}"
 }
 
-# ----------------- 8) Live Monitor (New!) -----------------
+# ----------------- 8) Live Monitor (Cleaned) -----------------
 monitor_stats(){
-  # 这是一个实时刷新的函数
+  clear
   while true; do
-    clear
-    echo -e "${BLUE}=== 实时流量监控 (Ctrl+C 退出) ===${PLAIN}"
-    echo -e "时间: $(date +%T)"
-    echo -e "------------------------------------------------------------------"
-    printf "%-8s %-8s %-5s %-10s %-15s %-15s\n" "TYPE" "TARGET" "DIR" "RATE" "SENT TOTAL" "DROPPED"
-    echo -e "------------------------------------------------------------------"
+    # 原地刷新逻辑
+    if command -v tput >/dev/null 2>&1; then tput cup 0 0; else clear; fi
+
+    echo -e "${BLUE}=== 实时流量监控 [按回车返回] ===${PLAIN}"
+    echo -e "刷新时间: $(date +%T)"
+    echo -e "----------------------------------------------------"
+    printf "%-6s %-6s %-4s %-8s %-10s %-8s\n" "TYPE" "PORT" "DIR" "LIMIT" "SENT" "DROP"
+    echo -e "----------------------------------------------------"
     
     if [[ ! -s "$DB_FILE" ]]; then
-      echo -e "${YELLOW}   (当前无任何限速规则)${PLAIN}"
+      echo -e "${YELLOW}   (当前无限速规则)${PLAIN}"
+      echo ""; echo ""
     else
       while IFS='|' read -r type key dir mbps ts meta; do
          local dev="$INTERFACE"
          local classid=""
          local sent="-"
-         local dropped="-"
+         local dropped="0"
          
          if [[ "$type" == "XRAY" && "$dir" == "out" ]]; then classid="1:200"; fi
          if [[ "$type" == "XRAY" && "$dir" == "in" ]]; then dev="$IFB_DEV"; classid="1:201"; fi
@@ -537,31 +529,33 @@ monitor_stats(){
          fi
 
          if [[ -n "$classid" ]]; then
-           # 解析 tc -s 输出
-           local raw
-           raw="$(tc -s class show dev "$dev" classid "$classid" 2>/dev/null)"
+           local raw; raw="$(tc -s class show dev "$dev" classid "$classid" 2>/dev/null)"
            if [[ -n "$raw" ]]; then
-             # 提取 Sent 字节
              local bytes; bytes="$(echo "$raw" | grep -oP 'Sent \K[0-9]+' | head -1)"
              if [[ -n "$bytes" ]]; then
-               # 简单单位转换
-               if [[ "$bytes" -gt 1073741824 ]]; then sent="$(awk -v b="$bytes" 'BEGIN{printf "%.2f G", b/1073741824}')"
-               elif [[ "$bytes" -gt 1048576 ]]; then sent="$(awk -v b="$bytes" 'BEGIN{printf "%.2f M", b/1048576}')"
-               else sent="${bytes} B"; fi
+               if [[ "$bytes" -gt 1073741824 ]]; then sent="$(awk -v b="$bytes" 'BEGIN{printf "%.1fG", b/1073741824}')"
+               elif [[ "$bytes" -gt 1048576 ]]; then sent="$(awk -v b="$bytes" 'BEGIN{printf "%.1fM", b/1048576}')"
+               elif [[ "$bytes" -gt 1024 ]]; then sent="$(awk -v b="$bytes" 'BEGIN{printf "%.0fK", b/1024}')"
+               else sent="${bytes}"; fi
              fi
-             # 提取 Dropped 包
              local drop; drop="$(echo "$raw" | grep -oP 'dropped \K[0-9]+' | head -1)"
              [[ -n "$drop" ]] && dropped="$drop"
-             [[ "$dropped" != "0" ]] && dropped="${RED}${dropped}${PLAIN}" # 丢包标红
            fi
          fi
          
-         printf "%-8s %-8s %-5s %-10s %-15s %-15s\n" "$type" "$key" "$dir" "${mbps}M" "$sent" "$dropped"
+         printf "%-6s %-6s %-4s %-8s %-10s " "$type" "$key" "$dir" "${mbps}M" "$sent"
+         if [[ "$dropped" != "0" && "$dropped" != "-" ]]; then
+             echo -e "${RED}${dropped}${PLAIN}"
+         else
+             echo -e "${dropped}"
+         fi
       done < "$DB_FILE"
     fi
-    echo -e "------------------------------------------------------------------"
-    echo -e "${YELLOW}提示：Dropped > 0 表示限速正在生效并丢弃多余数据包${PLAIN}"
-    sleep 2
+    echo -e "----------------------------------------------------"
+    
+    # 等待2秒或用户输入
+    read -t 2 -n 1 -s -r
+    if [[ $? -eq 0 ]]; then break; fi
   done
 }
 
@@ -570,10 +564,8 @@ do_uninstall(){
   echo -e "${RED}警告：这将清除所有限速规则并删除脚本配置文件！${PLAIN}"
   read -p "确定要继续吗? (y/N): " confirm
   [[ "$confirm" != "y" ]] && return
-  
   reset_all
   rm -rf "$STATE_DIR"
-  
   echo -e "${GREEN}卸载完成。${PLAIN}"
   echo -e "你可以手动删除此脚本: rm $0"
   exit 0
@@ -583,19 +575,19 @@ do_uninstall(){
 show_menu(){
   clear
   echo -e "=================================================="
-  echo -e "   VPS 流量控制台 V10.7 (Pro)"
+  echo -e "   VPS 流量控制台 V10.9 (Final)"
   echo -e "   网卡: ${GREEN}${INTERFACE}${PLAIN} | IFB: ${GREEN}${IFB_DEV}${PLAIN}"
   echo -e "   nftables: $(has_nft && echo -e "${GREEN}OK${PLAIN}" || echo -e "${YELLOW}缺失${PLAIN}")"
   echo -e "=================================================="
-  echo -e "1. 监听端口 (列表展示)"
-  echo -e "2. 限制 Xray 速度 (Docker/UID 增强版)"
-  echo -e "3. 限制 特定端口 速率 (手动输入)"
+  echo -e "1. 监听端口 (列表)"
+  echo -e "2. 限制 Xray 速度 (Docker/UID)"
+  echo -e "3. 限制 特定端口 速率 (手动)"
   echo -e "4. 查看限速清单"
   echo -e "5. 移除 Xray 限速"
   echo -e "6. 全部重置 (Reset)"
   echo -e "--------------------------------------------------"
-  echo -e "7. Speedtest (Ookla 官方版 + 节点选择)"
-  echo -e "8. 实时流量监控面板 (Live Monitor)"
+  echo -e "7. Speedtest (Ookla 官方版)"
+  echo -e "8. 实时流量监控 (Live Monitor)"
   echo -e "9. 彻底卸载与清理"
   echo -e "0. 退出"
   echo -e "=================================================="
