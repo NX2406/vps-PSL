@@ -1,20 +1,24 @@
 #!/bin/bash
 # ==================================================
-# VPS 流量控制台 V10.5 (3x-ui / Xray + Per-Port Shaping + ASCII Speedtest Bar)
+# VPS 流量控制台 V10.7 (Xray + Per-Port + Real-time Monitor + Ookla)
 #
 # 功能：
-# 1) 监听目前所有端口（TCP/UDP，支持编号点选）
-# 2) 限制 Xray 总出站/总入站速度（可分开设置）
+# 1) 监听目前所有端口 (列表展示)
+# 2) 限制 Xray 总出站/总入站速度（支持 Docker/手动 UID）
 # 3) 限制 特定端口 速率（上下行可分开设置）
 # 4) 查看当前所有端口/项目的限速情况（清单）
 # 5) 移除 Xray 的限速（入站/出站）
 # 6) 全部重置（恢复脚本修改的所有项目）
-# 7) Speedtest（指定端口；固定 500MB；上下行分开；ASCII 块状进度条）
+# 7) Speedtest by Ookla (美化版，支持指定服务器，自动 Fallback 安装)
+# 8) 实时流量与丢包监控 (Live Monitor)
+# 9) 彻底卸载 (清理所有配置和残留)
 # 0) 退出
 #
-# 关键修复：
-# - 修复 classid/handle 溢出导致的 “创建 TBF 失败”：使用 minor 分配器，保证 <= fffd
-# - Speedtest：使用 curl -#（ASCII 进度条）；耗时写临时文件避免破坏进度条
+# 更新日志 V10.7:
+# - [新增] 实时监控面板 (Menu 8)
+# - [新增] 卸载功能 (Menu 9)
+# - [优化] Xray 限速：支持手动输入 UID (兼容 Docker)
+# - [优化] Speedtest：增加二进制包下载兜底，优化界面输出，支持选节点
 # ==================================================
 
 set -u
@@ -23,11 +27,13 @@ RED='\033[31m'
 GREEN='\033[32m'
 YELLOW='\033[33m'
 BLUE='\033[36m'
+CYAN='\033[96m'
 PLAIN='\033[0m'
 
 [[ ${EUID:-999} -ne 0 ]] && echo -e "${RED}错误：请使用 root 用户运行！${PLAIN}" && exit 1
 
-for cmd in ip tc ss awk sed grep cut tr uname date mkdir mv rm modprobe ps id curl head wc mktemp cat; do
+# 检查基础命令
+for cmd in ip tc ss awk sed grep cut tr uname date mkdir mv rm modprobe ps id curl head wc mktemp cat tar; do
   command -v "$cmd" >/dev/null 2>&1 || { echo -e "${RED}缺少命令: $cmd${PLAIN}"; exit 1; }
 done
 
@@ -38,7 +44,7 @@ INTERFACE="$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')"
 [[ -z "$INTERFACE" ]] && echo -e "${RED}错误：无法识别主网卡（ip route get 8.8.8.8 失败）${PLAIN}" && exit 1
 IFB_DEV="ifb0"
 
-# shaping params
+# TC Params
 ROOT_RATE="10000mbit"
 ROOT_QUANTUM=200000
 USER_QUANTUM=15000
@@ -49,31 +55,23 @@ TBF_MIN_BURST_BYTES=32768
 DEFAULT_MINOR_HEX="fffe"
 DEFAULT_CLASSID="1:${DEFAULT_MINOR_HEX}"
 
-# xray
+# Xray Params
 XRAY_MARK_DEC="1"
 NFT_TABLE="vps_tc"
 NFT_CHAIN="out_mark"
 XRAY_OUT_CLASSID="1:200"
 XRAY_IN_CLASSID="1:201"
 
-# state db
+# DB
 STATE_DIR="/var/lib/vps-tc"
-DB_FILE="${STATE_DIR}/limits.db"   # type|key|dir|mbps|ts|meta
+DB_FILE="${STATE_DIR}/limits.db"
 mkdir -p "$STATE_DIR" >/dev/null 2>&1 || true
 touch "$DB_FILE" >/dev/null 2>&1 || true
 
-# speedtest fixed payloads
-SPEEDTEST_MB=500
-SPEEDTEST_BYTES=$((SPEEDTEST_MB * 1000000))
-
-SELECTED_PORT=""
-
 # ---------------- utils ----------------
 is_number(){ [[ "$1" =~ ^[0-9]+$ ]]; }
-
 try_modprobe(){ modprobe "$1" >/dev/null 2>&1 || true; }
 
-# 打印 stderr 以便定位（tc 常见失败点）
 run_or_fail(){
   local msg="$1"; shift
   local err
@@ -85,7 +83,7 @@ run_or_fail(){
   return 0
 }
 
-# DB
+# DB Ops
 db_upsert(){
   local type="$1" key="$2" dir="$3" mbps="$4" meta="$5"
   local ts; ts="$(date +%F_%T)"
@@ -98,13 +96,8 @@ db_delete_prefix(){
   grep -vE "^${type}\|${key}\|" "$DB_FILE" > "${DB_FILE}.tmp" 2>/dev/null || true
   mv -f "${DB_FILE}.tmp" "$DB_FILE" >/dev/null 2>&1 || true
 }
-db_delete_exact(){
-  local type="$1" key="$2" dir="$3"
-  grep -vE "^${type}\|${key}\|${dir}\|" "$DB_FILE" > "${DB_FILE}.tmp" 2>/dev/null || true
-  mv -f "${DB_FILE}.tmp" "$DB_FILE" >/dev/null 2>&1 || true
-}
 
-# ---------------- modules ----------------
+# ---------------- modules & init ----------------
 init_modules(){
   try_modprobe ifb
   try_modprobe sch_htb
@@ -116,10 +109,9 @@ init_modules(){
   try_modprobe cls_flower
 }
 
-# ---------------- tc init ----------------
 ensure_ifb(){
   if ! ip link show "$IFB_DEV" >/dev/null 2>&1; then
-    run_or_fail "创建 IFB($IFB_DEV) 失败（内核不支持 ifb 或权限问题）" ip link add "$IFB_DEV" type ifb || return 1
+    run_or_fail "创建 IFB 失败" ip link add "$IFB_DEV" type ifb || return 1
   fi
   ip link set dev "$IFB_DEV" up >/dev/null 2>&1 || true
   return 0
@@ -127,47 +119,37 @@ ensure_ifb(){
 
 ensure_ingress_redirect(){
   ensure_ifb || return 1
-
   if ! tc qdisc show dev "$INTERFACE" 2>/dev/null | grep -q "ffff:"; then
-    run_or_fail "创建 ingress qdisc 失败" tc qdisc add dev "$INTERFACE" handle ffff: ingress || return 1
+    run_or_fail "创建 ingress qdisc" tc qdisc add dev "$INTERFACE" handle ffff: ingress || return 1
   fi
-
   if ! tc filter show dev "$INTERFACE" parent ffff: 2>/dev/null | grep -q "protocol ip.*mirred.*redirect.*${IFB_DEV}"; then
     tc filter del dev "$INTERFACE" parent ffff: protocol ip prio 1 >/dev/null 2>&1 || true
-    run_or_fail "设置 IPv4 ingress redirect 失败" tc filter add dev "$INTERFACE" parent ffff: protocol ip prio 1 u32 \
-      match u32 0 0 action mirred egress redirect dev "$IFB_DEV" || return 1
+    run_or_fail "IPv4 ingress redirect" tc filter add dev "$INTERFACE" parent ffff: protocol ip prio 1 u32 match u32 0 0 action mirred egress redirect dev "$IFB_DEV" || return 1
   fi
-
-  # IPv6 best-effort
   if ! tc filter show dev "$INTERFACE" parent ffff: 2>/dev/null | grep -q "protocol ipv6.*mirred.*redirect.*${IFB_DEV}"; then
     tc filter del dev "$INTERFACE" parent ffff: protocol ipv6 prio 2 >/dev/null 2>&1 || true
-    tc filter add dev "$INTERFACE" parent ffff: protocol ipv6 prio 2 u32 \
-      match u32 0 0 action mirred egress redirect dev "$IFB_DEV" >/dev/null 2>&1 || true
+    tc filter add dev "$INTERFACE" parent ffff: protocol ipv6 prio 2 u32 match u32 0 0 action mirred egress redirect dev "$IFB_DEV" >/dev/null 2>&1 || true
   fi
-
   return 0
 }
 
 ensure_htb_tree(){
   local dev="$1"
   if ! tc qdisc show dev "$dev" 2>/dev/null | grep -q "htb 1:"; then
-    run_or_fail "在 $dev 创建 root HTB 失败" tc qdisc add dev "$dev" root handle 1: htb default "$DEFAULT_MINOR_HEX" r2q 10 || return 1
+    run_or_fail "Root HTB on $dev" tc qdisc add dev "$dev" root handle 1: htb default "$DEFAULT_MINOR_HEX" r2q 10 || return 1
   else
     tc qdisc replace dev "$dev" root handle 1: htb default "$DEFAULT_MINOR_HEX" r2q 10 >/dev/null 2>&1 || true
   fi
-
   if ! tc class show dev "$dev" 2>/dev/null | grep -q "1:1 "; then
-    run_or_fail "在 $dev 创建 class 1:1 失败" tc class add dev "$dev" parent 1: classid 1:1 htb rate "$ROOT_RATE" quantum "$ROOT_QUANTUM" || return 1
+    run_or_fail "Root Class 1:1" tc class add dev "$dev" parent 1: classid 1:1 htb rate "$ROOT_RATE" quantum "$ROOT_QUANTUM" || return 1
   else
-    tc class replace dev "$dev" parent 1: classid 1:1 htb rate "$ROOT_RATE" quantum "$ROOT_QUANTUM" >/dev/null 2>&1 || true
+    tc class replace dev "$dev" parent 1:1 classid 1:1 htb rate "$ROOT_RATE" quantum "$ROOT_QUANTUM" >/dev/null 2>&1 || true
   fi
-
   if ! tc class show dev "$dev" 2>/dev/null | grep -q "${DEFAULT_CLASSID} "; then
-    run_or_fail "在 $dev 创建 default class 失败" tc class add dev "$dev" parent 1:1 classid "$DEFAULT_CLASSID" htb rate "$ROOT_RATE" quantum "$ROOT_QUANTUM" || return 1
+    run_or_fail "Default Class" tc class add dev "$dev" parent 1:1 classid "$DEFAULT_CLASSID" htb rate "$ROOT_RATE" quantum "$ROOT_QUANTUM" || return 1
   else
     tc class replace dev "$dev" parent 1:1 classid "$DEFAULT_CLASSID" htb rate "$ROOT_RATE" quantum "$ROOT_QUANTUM" >/dev/null 2>&1 || true
   fi
-
   tc qdisc replace dev "$dev" parent "$DEFAULT_CLASSID" handle fffe: fq_codel >/dev/null 2>&1 || true
   return 0
 }
@@ -185,117 +167,110 @@ attach_precise_leaf(){
   local burst_bytes=$(( rate_kbit * 25 / 10 ))
   [[ "$burst_bytes" -lt "$TBF_MIN_BURST_BYTES" ]] && burst_bytes="$TBF_MIN_BURST_BYTES"
   local latency="${TBF_LATENCY_MS}ms"
-
   local tbf_handle="${handle_major_hex}:"
   local inner_parent="${handle_major_hex}:1"
 
-  tc qdisc del dev "$dev" parent "$classid" >/dev/null 2>&1 || seevde true
-  run_or_fail "在 $dev/$classid 创建 TBF 失败" tc qdisc add dev "$dev" parent "$classid" handle "$tbf_handle" tbf \
+  tc qdisc del dev "$dev" parent "$classid" >/dev/null 2>&1 || true
+  run_or_fail "Leaf TBF on $dev/$classid" tc qdisc add dev "$dev" parent "$classid" handle "$tbf_handle" tbf \
     rate "${rate_kbit}kbit" burst "${burst_bytes}" latency "$latency" || return 1
   tc qdisc replace dev "$dev" parent "$inner_parent" handle "${handle_major_hex}f:" fq_codel >/dev/null 2>&1 || true
   return 0
 }
 
-# ==================================================
-# ID allocator (fix overflow)
-# ==================================================
-minor_in_use(){
-  local minor_hex="$1"
-  grep -E "minor=${minor_hex}\s*$" "$DB_FILE" >/dev/null 2>&1
-}
-
+# ----------------- Allocation -----------------
+minor_in_use(){ grep -E "minor=$1\s*$" "$DB_FILE" >/dev/null 2>&1; }
 alloc_minor_for_port(){
   local port="$1"
   local start=$((1000 + (port % 50000)))
-  local m="$start"
-  local tries=0
+  local m="$start"; local tries=0
   while [[ "$tries" -lt 60000 ]]; do
     [[ "$m" -ge 65533 ]] && m=1000
     local hex; hex="$(printf '%x' "$m")"
-    if ! minor_in_use "$hex"; then
-      echo "$hex"
-      return 0
-    fi
-    m=$((m+1))
-    tries=$((tries+1))
+    if ! minor_in_use "$hex"; then echo "$hex"; return 0; fi
+    m=$((m+1)); tries=$((tries+1))
   done
-  echo ""
-  return 1
+  echo ""; return 1
 }
 
-# ==================================================
-# 1) Listening ports (keep numeric selection)
-# ==================================================
-select_active_port(){
-  echo -e "${YELLOW}[List] 正在扫描监听端口(TCP/UDP)...${PLAIN}"
+# ----------------- 1) List Ports -----------------
+list_active_ports(){
+  echo -e "${YELLOW}[List] 扫描监听端口...${PLAIN}"
   echo -e "------------------------------------------------"
-  printf "%-5s %-6s %-8s %-20s\n" "编号" "协议" "端口" "进程"
+  printf "%-6s %-8s %-20s\n" "协议" "端口" "进程"
   echo -e "------------------------------------------------"
-
-  declare -a plist
-  declare -a proto_list
-  local idx=1
-
   while read -r proto state localaddr _peer process; do
     local tag="" color="$PLAIN"
     if [[ "$proto" == "tcp" && "$state" == "LISTEN" ]]; then tag="TCP"; color="$GREEN"
     elif [[ "$proto" == "udp" && "$state" == "UNCONN" ]]; then tag="UDP"; color="$BLUE"
-    else continue
-    fi
-
-    local port
-    port="$(echo "$localaddr" | awk -F':' '{print $NF}')"
+    else continue; fi
+    local port; port="$(echo "$localaddr" | awk -F':' '{print $NF}')"
     is_number "$port" || continue
-
-    local pname
-    pname="$(echo "$process" | awk -F'"' '{print $2}')"
+    local pname; pname="$(echo "$process" | awk -F'"' '{print $2}')"
     [[ -z "$pname" ]] && pname="-"
-
-    plist[$idx]="$port"
-    proto_list[$idx]="$proto"
-    printf "${color}[%d]${PLAIN}  %-6s %-8s %-20s\n" "$idx" "$tag" "$port" "$pname"
-    idx=$((idx+1))
-  done < <(ss -H -tunlp 2>/dev/null | awk '{print $1, $2, $5, $6, $7}')
-
+    printf "${color}%-6s${PLAIN} %-8s %-20s\n" "$tag" "$port" "$pname"
+  done < <(ss -H -tunlp 2>/dev/null | awk '{print $1, $2, $5, $6, $7}' | sort -k3 -t' ' -n)
   echo -e "------------------------------------------------"
-  echo -e "${GREEN}[m]${PLAIN} 手动输入端口"
-  echo -e "------------------------------------------------"
-  read -p "请选择编号(或 m): " sel
-
-  if [[ "$sel" == "m" ]]; then
-    read -p "请输入端口号: " p
-    if ! is_number "$p" || [[ "$p" -le 0 || "$p" -gt 65535 ]]; then
-      echo -e "${RED}端口无效${PLAIN}"
-      SELECTED_PORT=""
-      return
-    fi
-    SELECTED_PORT="$p"
-  else
-    if [[ -n "${plist[$sel]:-}" ]]; then
-      SELECTED_PORT="${plist[$sel]}"
-      echo -e "${BLUE}你选择了端口: ${SELECTED_PORT} (${proto_list[$sel]^^})${PLAIN}"
-    else
-      echo -e "${RED}无效选择${PLAIN}"
-      SELECTED_PORT=""
-    fi
-  fi
 }
+menu_list_ports(){ clear; echo -e "${BLUE}--- 监听端口列表 ---${PLAIN}"; list_active_ports; }
 
-menu_list_ports(){
-  clear
-  echo -e "${BLUE}--- 监听端口列表（TCP/UDP，支持编号点选）---${PLAIN}"
-  select_active_port || true
-}
-
-# ==================================================
-# 2) Xray total limit
-# ==================================================
-detect_xray_uid(){
-  local uid=""
+# ----------------- 2) Xray Limits -----------------
+detect_xray_uid_auto(){
+  local uid
   uid="$(ps -eo comm,uid 2>/dev/null | awk '$1=="xray"{print $2; exit}')"
   [[ -z "$uid" ]] && uid="$(ps -eo comm,uid 2>/dev/null | awk '$1 ~ /^xray/ {print $2; exit}')"
   [[ -z "$uid" ]] && { id -u xray >/dev/null 2>&1 && uid="$(id -u xray)"; }
   echo "$uid"
+}
+
+ensure_nft_mark_rule(){
+  local uid="$1"
+  if ! has_nft; then echo -e "${RED}[FAIL]${PLAIN} 未安装 nftables"; return 1; fi
+  nft list table inet "$NFT_TABLE" >/dev/null 2>&1 || nft add table inet "$NFT_TABLE" >/dev/null 2>&1 || true
+  if ! nft list chain inet "$NFT_TABLE" "$NFT_CHAIN" >/dev/null 2>&1; then
+    nft add chain inet "$NFT_TABLE" "$NFT_CHAIN" "{ type filter hook output priority mangle; policy accept; }" >/dev/null 2>&1 || true
+  fi
+  # 检查是否已存在该UID规则
+  if nft list chain inet "$NFT_TABLE" "$NFT_CHAIN" 2>/dev/null | grep -q "meta skuid .* meta mark set ${XRAY_MARK_DEC}"; then
+    # 如果已存在但UID不同，这里暂不处理复杂替换，假设用户只有一个xray实例
+    return 0
+  fi
+  run_or_fail "nft add rule" nft add rule inet "$NFT_TABLE" "$NFT_CHAIN" meta skuid "$uid" meta mark set "$XRAY_MARK_DEC" || return 1
+  return 0
+}
+
+apply_xray_out_limit(){
+  local mbps="$1"
+  local uid; uid="$(detect_xray_uid_auto)"
+  
+  # 优化：如果找不到UID，询问用户
+  if [[ -z "$uid" ]]; then
+    echo -e "${YELLOW}警告：未能自动检测到 Xray 进程 UID。${PLAIN}"
+    echo -e "如果你正在使用 ${CYAN}Docker${PLAIN}，或者进程名不是 xray，请输入容器映射在宿主机的 UID。"
+    echo -e "(输入 0 或留空取消)"
+    read -p "手动输入 UID: " input_uid
+    if [[ -n "$input_uid" && "$input_uid" != "0" ]]; then
+      uid="$input_uid"
+    else
+      return 1
+    fi
+  fi
+  
+  echo -e "${BLUE}正在对 UID: ${uid} 实施出站限速...${PLAIN}"
+  ensure_nft_mark_rule "$uid" || return 1
+
+  local rate_kbit=$((mbps * 1000))
+  local handle_hex="0200"
+
+  tc filter del dev "$INTERFACE" parent 1:0 protocol all prio 10 >/dev/null 2>&1 || true
+  tc qdisc  del dev "$INTERFACE" parent "$XRAY_OUT_CLASSID" >/dev/null 2>&1 || true
+  tc class  del dev "$INTERFACE" parent 1:1 classid "$XRAY_OUT_CLASSID" >/dev/null 2>&1 || true
+
+  run_or_fail "Class create" tc class add dev "$INTERFACE" parent 1:1 classid "$XRAY_OUT_CLASSID" htb rate "${rate_kbit}kbit" ceil "${rate_kbit}kbit" burst "$HTB_BURST" quantum "$USER_QUANTUM" || return 1
+  attach_precise_leaf "$INTERFACE" "$XRAY_OUT_CLASSID" "$handle_hex" "$rate_kbit" || return 1
+  run_or_fail "Filter add" tc filter add dev "$INTERFACE" parent 1:0 protocol all prio 10 handle "$XRAY_MARK_DEC" fw flowid "$XRAY_OUT_CLASSID" || return 1
+
+  db_upsert "XRAY" "OUT" "out" "$mbps" "class=200,uid=$uid"
+  echo -e "${GREEN}[Success]${PLAIN} Xray(UID:$uid) 总出站限制：${mbps} Mbps"
 }
 
 get_xray_listen_ports(){
@@ -307,61 +282,13 @@ get_xray_listen_ports(){
   done | sort -n | uniq
 }
 
-ensure_nft_mark_rule(){
-  local uid="$1"
-  if ! has_nft; then
-    echo -e "${RED}[FAIL]${PLAIN} 未安装 nftables。建议：apt install -y nftables"
-    return 1
-  fi
-
-  nft list table inet "$NFT_TABLE" >/dev/null 2>&1 || nft add table inet "$NFT_TABLE" >/dev/null 2>&1 || true
-  if ! nft list chain inet "$NFT_TABLE" "$NFT_CHAIN" >/dev/null 2>&1; then
-    nft add chain inet "$NFT_TABLE" "$NFT_CHAIN" "{ type filter hook output priority mangle; policy accept; }" >/dev/null 2>&1 || true
-  fi
-
-  if nft list chain inet "$NFT_TABLE" "$NFT_CHAIN" 2>/dev/null | grep -q "meta skuid .* meta mark set ${XRAY_MARK_DEC}"; then
-    return 0
-  fi
-
-  run_or_fail "nft 添加 xray mark 规则失败（可能内核不支持 meta skuid）" \
-    nft add rule inet "$NFT_TABLE" "$NFT_CHAIN" meta skuid "$uid" meta mark set "$XRAY_MARK_DEC" || return 1
-  return 0
-}
-
-apply_xray_out_limit(){
-  local mbps="$1"
-  local uid; uid="$(detect_xray_uid)"
-  [[ -z "$uid" ]] && { echo -e "${RED}[FAIL]${PLAIN} 未找到 xray 进程/用户"; return 1; }
-
-  ensure_nft_mark_rule "$uid" || return 1
-
-  local rate_kbit=$((mbps * 1000))
-  local handle_hex="0200"
-
-  tc filter del dev "$INTERFACE" parent 1:0 protocol all prio 10 >/dev/null 2>&1 || true
-  tc qdisc  del dev "$INTERFACE" parent "$XRAY_OUT_CLASSID" >/dev/null 2>&1 || true
-  tc class  del dev "$INTERFACE" parent 1:1 classid "$XRAY_OUT_CLASSID" >/dev/null 2>&1 || true
-
-  run_or_fail "创建 xray 出站 class 失败" tc class add dev "$INTERFACE" parent 1:1 classid "$XRAY_OUT_CLASSID" htb \
-    rate "${rate_kbit}kbit" ceil "${rate_kbit}kbit" burst "$HTB_BURST" quantum "$USER_QUANTUM" || return 1
-
-  attach_precise_leaf "$INTERFACE" "$XRAY_OUT_CLASSID" "$handle_hex" "$rate_kbit" || return 1
-
-  run_or_fail "添加 fw filter 失败" tc filter add dev "$INTERFACE" parent 1:0 protocol all prio 10 \
-    handle "$XRAY_MARK_DEC" fw flowid "$XRAY_OUT_CLASSID" || return 1
-
-  db_upsert "XRAY" "OUT" "out" "$mbps" "class=200"
-  echo -e "${GREEN}[Success]${PLAIN} Xray 总出站限制：${mbps} Mbps"
-}
-
 apply_xray_in_limit(){
   local mbps="$1"
   local ports; ports="$(get_xray_listen_ports)"
-  [[ -z "$ports" ]] && { echo -e "${RED}[FAIL]${PLAIN} 未检测到 xray 正在监听端口"; return 1; }
+  [[ -z "$ports" ]] && { echo -e "${RED}[FAIL]${PLAIN} 未检测到 xray 监听端口 (无法应用入站限制)"; return 1; }
 
   local count; count="$(echo "$ports" | wc -l | tr -d ' ')"
-  echo -e "${YELLOW}检测到 Xray 监听端口数：${count}${PLAIN}"
-  echo -e "${YELLOW}端口列表：${PLAIN} $(echo "$ports" | tr '\n' ' ')"
+  echo -e "${YELLOW}检测到 ${count} 个端口:${PLAIN} $(echo "$ports" | tr '\n' ' ')"
 
   local rate_kbit=$((mbps * 1000))
   local handle_hex="0201"
@@ -369,18 +296,13 @@ apply_xray_in_limit(){
   tc qdisc del dev "$IFB_DEV" parent "$XRAY_IN_CLASSID" >/dev/null 2>&1 || true
   tc class del dev "$IFB_DEV" parent 1:1 classid "$XRAY_IN_CLASSID" >/dev/null 2>&1 || true
 
-  run_or_fail "创建 xray 入站 class 失败" tc class add dev "$IFB_DEV" parent 1:1 classid "$XRAY_IN_CLASSID" htb \
-    rate "${rate_kbit}kbit" ceil "${rate_kbit}kbit" burst "$HTB_BURST" quantum "$USER_QUANTUM" || return 1
-
+  run_or_fail "Class create" tc class add dev "$IFB_DEV" parent 1:1 classid "$XRAY_IN_CLASSID" htb rate "${rate_kbit}kbit" ceil "${rate_kbit}kbit" burst "$HTB_BURST" quantum "$USER_QUANTUM" || return 1
   attach_precise_leaf "$IFB_DEV" "$XRAY_IN_CLASSID" "$handle_hex" "$rate_kbit" || return 1
 
   while read -r p; do
     [[ -z "$p" ]] && continue
-
     tc filter del dev "$IFB_DEV" parent 1:0 protocol ip prio "$p" >/dev/null 2>&1 || true
-    tc filter add dev "$IFB_DEV" parent 1:0 protocol ip prio "$p" u32 \
-      match ip dport "$p" 0xffff flowid "$XRAY_IN_CLASSID" >/dev/null 2>&1 || true
-
+    tc filter add dev "$IFB_DEV" parent 1:0 protocol ip prio "$p" u32 match ip dport "$p" 0xffff flowid "$XRAY_IN_CLASSID" >/dev/null 2>&1 || true
     tc filter del dev "$IFB_DEV" parent 1:0 protocol ipv6 prio "$p" >/dev/null 2>&1 || true
     if has_flower; then
       tc filter add dev "$IFB_DEV" parent 1:0 protocol ipv6 prio "$p" flower ip_proto tcp dst_port "$p" flowid "$XRAY_IN_CLASSID" >/dev/null 2>&1 || true
@@ -388,51 +310,33 @@ apply_xray_in_limit(){
     fi
   done <<< "$ports"
 
-  if ! has_flower; then
-    echo -e "${YELLOW}提示：flower 不可用时，IPv6 入站端口匹配可能不完整（IPv6 可能绕过）。${PLAIN}"
-  fi
-
   db_upsert "XRAY" "IN" "in" "$mbps" "class=201"
   echo -e "${GREEN}[Success]${PLAIN} Xray 总入站限制：${mbps} Mbps"
 }
 
 menu_set_xray_limits(){
-  echo -e "\n${BLUE}--- 限制 Xray 总出站/总入站速度（可分开设置）---${PLAIN}"
-  echo -e "1) 仅限制 出站"
-  echo -e "2) 仅限制 入站"
-  echo -e "3) 同时限制 入站+出站"
-  read -p "选择[1-3]: " sel
-
-  read -p "请输入速率(Mbps): " mbps
-  if ! is_number "$mbps" || [[ "$mbps" -le 0 ]]; then
-    echo -e "${RED}错误：速率必须为正整数 Mbps${PLAIN}"
-    return
-  fi
-
-  init_all || { echo -e "${RED}[FAIL]${PLAIN} 初始化 tc/ifb 失败"; return; }
-
+  echo -e "\n${BLUE}--- 限制 Xray 速度 ---${PLAIN}"
+  echo -e "1) 仅限制 出站 (支持 Docker/手动 UID)"
+  echo -e "2) 仅限制 入站 (基于监听端口)"
+  echo -e "3) 限制 入站+出站"
+  read -p "选择: " sel
+  read -p "输入速率(Mbps): " mbps
+  [[ ! "$mbps" =~ ^[0-9]+$ ]] && echo -e "${RED}无效数字${PLAIN}" && return
+  init_all || { echo -e "${RED}Init failed${PLAIN}"; return; }
   case "$sel" in
     1) apply_xray_out_limit "$mbps" ;;
     2) apply_xray_in_limit "$mbps" ;;
     3) apply_xray_out_limit "$mbps" && apply_xray_in_limit "$mbps" ;;
-    *) echo -e "${YELLOW}无效选择${PLAIN}" ;;
   esac
 }
 
-# ==================================================
-# 3) Per-port shaping (split in/out)
-# ==================================================
+# ----------------- 3) Port Limits -----------------
 apply_port_limit_one(){
   local port="$1" dir="$2" mbps="$3"
   local rate_kbit=$((mbps * 1000))
-
-  local minor_hex
-  minor_hex="$(alloc_minor_for_port "$port")"
-  if [[ -z "$minor_hex" ]]; then
-    echo -e "${RED}[FAIL]${PLAIN} 无法为端口 ${port} 分配 classid（minor 池耗尽）"
-    return 1
-  fi
-
+  local minor_hex; minor_hex="$(alloc_minor_for_port "$port")"
+  [[ -z "$minor_hex" ]] && { echo -e "${RED}ClassID 耗尽${PLAIN}"; return 1; }
+  
   local classid="1:${minor_hex}"
   local handle_hex="$minor_hex"
 
@@ -441,25 +345,18 @@ apply_port_limit_one(){
     tc filter del dev "$INTERFACE" parent 1:0 protocol ipv6 prio "$port" >/dev/null 2>&1 || true
     tc class del dev "$INTERFACE" parent 1:1 classid "$classid" >/dev/null 2>&1 || true
 
-    run_or_fail "创建端口出站 class 失败" tc class add dev "$INTERFACE" parent 1:1 classid "$classid" htb \
-      rate "${rate_kbit}kbit" ceil "${rate_kbit}kbit" burst "$HTB_BURST" quantum "$USER_QUANTUM" || return 1
-
+    run_or_fail "Class create" tc class add dev "$INTERFACE" parent 1:1 classid "$classid" htb rate "${rate_kbit}kbit" ceil "${rate_kbit}kbit" burst "$HTB_BURST" quantum "$USER_QUANTUM" || return 1
     attach_precise_leaf "$INTERFACE" "$classid" "$handle_hex" "$rate_kbit" || return 1
 
-    run_or_fail "添加 IPv4 出站 sport(TCP) 失败" tc filter add dev "$INTERFACE" parent 1:0 protocol ip prio "$port" u32 \
-      match ip protocol 6 0xff match ip sport "$port" 0xffff flowid "$classid" || return 1
-    tc filter add dev "$INTERFACE" parent 1:0 protocol ip prio "$port" u32 \
-      match ip protocol 17 0xff match ip sport "$port" 0xffff flowid "$classid" >/dev/null 2>&1 || true
-
+    run_or_fail "Filter IPv4" tc filter add dev "$INTERFACE" parent 1:0 protocol ip prio "$port" u32 match ip protocol 6 0xff match ip sport "$port" 0xffff flowid "$classid" || return 1
+    tc filter add dev "$INTERFACE" parent 1:0 protocol ip prio "$port" u32 match ip protocol 17 0xff match ip sport "$port" 0xffff flowid "$classid" >/dev/null 2>&1 || true
+    
     if has_flower; then
       tc filter add dev "$INTERFACE" parent 1:0 protocol ipv6 prio "$port" flower ip_proto tcp src_port "$port" flowid "$classid" >/dev/null 2>&1 || true
       tc filter add dev "$INTERFACE" parent 1:0 protocol ipv6 prio "$port" flower ip_proto udp src_port "$port" flowid "$classid" >/dev/null 2>&1 || true
-    else
-      echo -e "${YELLOW}提示：flower 不可用时，IPv6 出站端口匹配可能绕过。${PLAIN}"
     fi
-
     db_upsert "PORT" "$port" "out" "$mbps" "minor=${minor_hex}"
-    echo -e "${GREEN}[Success]${PLAIN} 端口 ${port} 出站限制：${mbps} Mbps (class ${classid})"
+    echo -e "${GREEN}[Success]${PLAIN} 端口 ${port} 出站限制：${mbps} Mbps"
     return 0
   fi
 
@@ -468,195 +365,238 @@ apply_port_limit_one(){
     tc filter del dev "$IFB_DEV" parent 1:0 protocol ipv6 prio "$port" >/dev/null 2>&1 || true
     tc class del dev "$IFB_DEV" parent 1:1 classid "$classid" >/dev/null 2>&1 || true
 
-    run_or_fail "创建端口入站 class 失败" tc class add dev "$IFB_DEV" parent 1:1 classid "$classid" htb \
-      rate "${rate_kbit}kbit" ceil "${rate_kbit}kbit" burst "$HTB_BURST" quantum "$USER_QUANTUM" || return 1
-
+    run_or_fail "Class create" tc class add dev "$IFB_DEV" parent 1:1 classid "$classid" htb rate "${rate_kbit}kbit" ceil "${rate_kbit}kbit" burst "$HTB_BURST" quantum "$USER_QUANTUM" || return 1
     attach_precise_leaf "$IFB_DEV" "$classid" "$handle_hex" "$rate_kbit" || return 1
 
-    run_or_fail "添加 IPv4 入站 dport 失败" tc filter add dev "$IFB_DEV" parent 1:0 protocol ip prio "$port" u32 \
-      match ip dport "$port" 0xffff flowid "$classid" || return 1
-
+    run_or_fail "Filter IPv4" tc filter add dev "$IFB_DEV" parent 1:0 protocol ip prio "$port" u32 match ip dport "$port" 0xffff flowid "$classid" || return 1
     if has_flower; then
       tc filter add dev "$IFB_DEV" parent 1:0 protocol ipv6 prio "$port" flower ip_proto tcp dst_port "$port" flowid "$classid" >/dev/null 2>&1 || true
       tc filter add dev "$IFB_DEV" parent 1:0 protocol ipv6 prio "$port" flower ip_proto udp dst_port "$port" flowid "$classid" >/dev/null 2>&1 || true
-    else
-      echo -e "${YELLOW}提示：flower 不可用时，IPv6 入站端口匹配可能绕过。${PLAIN}"
     fi
-
     db_upsert "PORT" "$port" "in" "$mbps" "minor=${minor_hex}"
-    echo -e "${GREEN}[Success]${PLAIN} 端口 ${port} 入站限制：${mbps} Mbps (class ${classid})"
+    echo -e "${GREEN}[Success]${PLAIN} 端口 ${port} 入站限制：${mbps} Mbps"
     return 0
   fi
-
-  return 1
 }
 
 menu_port_limit(){
-  echo -e "\n${BLUE}--- 限制特定端口速率（上下行可分开设置）---${PLAIN}"
-  select_active_port
-  [[ -z "$SELECTED_PORT" ]] && return
-  local port="$SELECTED_PORT"
+  echo -e "\n${BLUE}--- 特定端口限速 ---${PLAIN}"
+  list_active_ports
+  echo -e "${GREEN}[输入]${PLAIN} 请输入端口号:"
+  read -p "端口: " port
+  if ! is_number "$port" || [[ "$port" -le 0 || "$port" -gt 65535 ]]; then echo -e "${RED}端口无效${PLAIN}"; return; fi
 
-  echo -e "\n选择方向："
-  echo -e "1) 仅限制 ${GREEN}出站/下行${PLAIN}"
-  echo -e "2) 仅限制 ${GREEN}入站/上行${PLAIN}"
-  echo -e "3) 同时限制 ${YELLOW}入站+出站${PLAIN}"
-  read -p "选择[1-3]: " sel
-
-  read -p "请输入速率(Mbps): " mbps
-  if ! is_number "$mbps" || [[ "$mbps" -le 0 ]]; then
-    echo -e "${RED}错误：速率必须为正整数 Mbps${PLAIN}"
-    return
-  fi
-
-  init_all || { echo -e "${RED}[FAIL]${PLAIN} 初始化 tc/ifb 失败"; return; }
-
+  echo -e "1) 仅限制 出站/下行\n2) 仅限制 入站/上行\n3) 限制 入站+出站"
+  read -p "选择: " sel
+  read -p "速率(Mbps): " mbps
+  [[ ! "$mbps" =~ ^[0-9]+$ ]] && echo -e "${RED}无效数字${PLAIN}" && return
+  init_all || { echo -e "${RED}Init failed${PLAIN}"; return; }
   case "$sel" in
     1) apply_port_limit_one "$port" "out" "$mbps" ;;
     2) apply_port_limit_one "$port" "in"  "$mbps" ;;
     3) apply_port_limit_one "$port" "out" "$mbps" && apply_port_limit_one "$port" "in" "$mbps" ;;
-    *) echo -e "${YELLOW}无效选择${PLAIN}" ;;
   esac
 }
 
-# ==================================================
-# 4) Show limits
-# ==================================================
+# ----------------- 4) Show List -----------------
 show_limits(){
   clear
-  echo -e "${BLUE}--- 当前限速清单（可靠记录）---${PLAIN}"
-  echo -e "网卡: ${GREEN}${INTERFACE}${PLAIN} | IFB: ${GREEN}${IFB_DEV}${PLAIN} | flower: $(has_flower && echo -e "${GREEN}OK${PLAIN}" || echo -e "${YELLOW}NO(IPv6可能绕过)${PLAIN}")"
-  echo -e "--------------------------------------------------------------------------------"
-  printf "%-8s %-8s %-6s %-8s %-20s %-12s\n" "类型" "对象" "方向" "速率" "时间" "附加"
-  echo -e "--------------------------------------------------------------------------------"
-
-  if [[ ! -s "$DB_FILE" ]]; then
-    echo -e "${YELLOW}(清单为空)${PLAIN}"
-    return
-  fi
-
+  echo -e "${BLUE}--- 当前限速清单 ---${PLAIN}"
+  echo -e "网卡: ${GREEN}${INTERFACE}${PLAIN} | IFB: ${GREEN}${IFB_DEV}${PLAIN}"
+  printf "%-8s %-8s %-6s %-8s %-20s\n" "类型" "对象" "方向" "速率" "备注"
+  echo -e "--------------------------------------------------------"
+  [[ ! -s "$DB_FILE" ]] && echo -e "${YELLOW}(空)${PLAIN}"
   while IFS='|' read -r type key dir mbps ts meta; do
-    printf "%-8s %-8s %-6s %-8s %-20s %-12s\n" "$type" "$key" "$dir" "${mbps}M" "$ts" "$meta"
+    printf "%-8s %-8s %-6s %-8s %-20s\n" "$type" "$key" "$dir" "${mbps}M" "$meta"
   done < "$DB_FILE"
-
-  echo -e "--------------------------------------------------------------------------------"
+  echo -e "--------------------------------------------------------"
 }
 
-# ==================================================
-# 5) Remove Xray limits
-# ==================================================
-remove_xray_out_limit(){
-  tc filter del dev "$INTERFACE" parent 1:0 protocol all prio 10 >/dev/null 2>&1 || true
-  tc qdisc  del dev "$INTERFACE" parent "$XRAY_OUT_CLASSID" >/dev/null 2>&1 || true
-  tc class  del dev "$INTERFACE" parent 1:1 classid "$XRAY_OUT_CLASSID" >/dev/null 2>&1 || true
-  if has_nft; then nft delete table inet "$NFT_TABLE" >/dev/null 2>&1 || true; fi
-  db_delete_prefix "XRAY" "OUT"
-  echo -e "${GREEN}已移除 Xray 总出站限速（并清理 nft 标记）${PLAIN}"
-}
-
-remove_xray_in_limit(){
-  tc qdisc del dev "$IFB_DEV" parent "$XRAY_IN_CLASSID" >/dev/null 2>&1 || true
-  tc class del dev "$IFB_DEV" parent 1:1 classid "$XRAY_IN_CLASSID" >/dev/null 2>&1 || true
-  db_delete_prefix "XRAY" "IN"
-  echo -e "${GREEN}已移除 Xray 总入站限速（IFB class 清理）${PLAIN}"
-  echo -e "${YELLOW}提示：若你多次设置过入站限速，可能残留端口 filter；可用“全部重置”一键清理。${PLAIN}"
-}
-
+# ----------------- 5 & 6) Remove / Reset -----------------
 menu_remove_xray_limits(){
-  echo -e "\n${BLUE}--- 移除 Xray 限速（入站/出站）---${PLAIN}"
-  echo -e "1) 仅移除 出站"
-  echo -e "2) 仅移除 入站"
-  echo -e "3) 移除 入站+出站"
-  read -p "选择[1-3]: " sel
+  echo -e "\n${BLUE}--- 移除 Xray 限速 ---${PLAIN}"
+  echo -e "1) 移除 出站\n2) 移除 入站\n3) 全部移除"
+  read -p "选择: " sel
   init_all >/dev/null 2>&1 || true
-  case "$sel" in
-    1) remove_xray_out_limit ;;
-    2) remove_xray_in_limit ;;
-    3) remove_xray_out_limit; remove_xray_in_limit ;;
-    *) echo -e "${YELLOW}无效选择${PLAIN}" ;;
-  esac
+  [[ "$sel" == "1" || "$sel" == "3" ]] && {
+     tc filter del dev "$INTERFACE" parent 1:0 protocol all prio 10 >/dev/null 2>&1 || true
+     tc qdisc  del dev "$INTERFACE" parent "$XRAY_OUT_CLASSID" >/dev/null 2>&1 || true
+     tc class  del dev "$INTERFACE" parent 1:1 classid "$XRAY_OUT_CLASSID" >/dev/null 2>&1 || true
+     has_nft && nft delete table inet "$NFT_TABLE" >/dev/null 2>&1 || true
+     db_delete_prefix "XRAY" "OUT"
+     echo -e "${GREEN}Xray 出站限制已移除${PLAIN}"
+  }
+  [[ "$sel" == "2" || "$sel" == "3" ]] && {
+     tc qdisc del dev "$IFB_DEV" parent "$XRAY_IN_CLASSID" >/dev/null 2>&1 || true
+     tc class del dev "$IFB_DEV" parent 1:1 classid "$XRAY_IN_CLASSID" >/dev/null 2>&1 || true
+     db_delete_prefix "XRAY" "IN"
+     echo -e "${GREEN}Xray 入站限制已移除${PLAIN}"
+  }
 }
 
-# ==================================================
-# 6) Reset all
-# ==================================================
 reset_all(){
   tc qdisc del dev "$INTERFACE" root >/dev/null 2>&1 || true
   tc qdisc del dev "$INTERFACE" ingress >/dev/null 2>&1 || true
   tc qdisc del dev "$IFB_DEV" root >/dev/null 2>&1 || true
   ip link set dev "$IFB_DEV" down >/dev/null 2>&1 || true
   ip link del dev "$IFB_DEV" >/dev/null 2>&1 || true
-  if has_nft; then nft delete table inet "$NFT_TABLE" >/dev/null 2>&1 || true; fi
-  : > "$DB_FILE" 2>/dev/null || true
-  echo -e "${GREEN}已全部重置：tc/IFB/nft/清单 全部清理完成${PLAIN}"
+  has_nft && nft delete table inet "$NFT_TABLE" >/dev/null 2>&1 || true
+  : > "$DB_FILE"
+  echo -e "${GREEN}已重置所有 TC/NFT 规则${PLAIN}"
 }
 
-# ==================================================
-# 7) Speedtest (ASCII bar, fixed 500MB, split)
-# ==================================================
-calc_mbps(){
-  local bytes="$1" sec="$2"
-  awk -v b="$bytes" -v s="$sec" 'BEGIN{ if(s<=0){print "0"; exit} printf "%.2f", (b*8/1000000)/s }'
-}
-
-speedtest_fixed_500mb(){
-  echo -e "\n${BLUE}--- Speedtest（固定 500MB，上下行分开，ASCII 块状进度条）---${PLAIN}"
-  read -p "测试主机(默认 speed.cloudflare.com): " host
-  [[ -z "$host" ]] && host="speed.cloudflare.com"
-
-  read -p "测试端口(默认 443，可填 80/443/其他): " port
-  [[ -z "$port" ]] && port="443"
-  if ! is_number "$port"; then
-    echo -e "${RED}端口必须是数字${PLAIN}"
-    return
+# ----------------- 7) Speedtest Ookla (Advanced) -----------------
+install_ookla_speedtest(){
+  echo -e "${YELLOW}检测到未安装 speedtest，正在安装...${PLAIN}"
+  local installed=0
+  
+  # 1. 尝试官方源
+  if [ -f /etc/debian_version ]; then
+    curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash >/dev/null 2>&1
+    apt-get update >/dev/null 2>&1 && apt-get install -y speedtest >/dev/null 2>&1 && installed=1
+  elif [ -f /etc/redhat-release ]; then
+    curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.rpm.sh | bash >/dev/null 2>&1
+    yum install -y speedtest >/dev/null 2>&1 && installed=1
   fi
 
-  local scheme="https"
-  [[ "$port" == "80" ]] && scheme="http"
-
-  local down_url="${scheme}://${host}:${port}/__down?bytes=${SPEEDTEST_BYTES}"
-  local up_url="${scheme}://${host}:${port}/__up"
-
-  local dtmp utmp
-  dtmp="$(mktemp /tmp/vps-tc-dl.XXXXXX)"
-  utmp="$(mktemp /tmp/vps-tc-ul.XXXXXX)"
-
-  echo -e "${YELLOW}下载测试中...${PLAIN} (${SPEEDTEST_MB}MB via ${host}:${port})"
-  # 关键：ASCII 进度条走 stderr（不要重定向 stderr）
-  # 耗时通过 stdout 写临时文件，避免破坏进度条显示
-  curl -# -o /dev/null --connect-timeout 8 --max-time 600 -w "%{time_total}" "$down_url" >"$dtmp"
-  local dtime; dtime="$(cat "$dtmp" 2>/dev/null)"
-  rm -f "$dtmp" >/dev/null 2>&1 || true
-  local dMbps; dMbps="$(calc_mbps "$SPEEDTEST_BYTES" "$dtime")"
-  echo -e "${GREEN}Download:${PLAIN} ${dMbps} Mbps  (耗时 ${dtime}s)"
-
-  echo -e "${YELLOW}上传测试中...${PLAIN} (${SPEEDTEST_MB}MB via ${host}:${port})"
-  head -c "$SPEEDTEST_BYTES" </dev/zero | \
-    curl -# -o /dev/null --connect-timeout 8 --max-time 600 -w "%{time_total}" \
-      -X POST --data-binary @- "$up_url" >"$utmp"
-  local utime; utime="$(cat "$utmp" 2>/dev/null)"
-  rm -f "$utmp" >/dev/null 2>&1 || true
-  local uMbps; uMbps="$(calc_mbps "$SPEEDTEST_BYTES" "$utime")"
-  echo -e "${GREEN}Upload:${PLAIN}   ${uMbps} Mbps  (耗时 ${utime}s)"
+  # 2. 如果源安装失败，尝试二进制下载 (Fallback)
+  if [[ "$installed" -eq 0 ]]; then
+    echo -e "${YELLOW}源安装失败，尝试下载二进制包...${PLAIN}"
+    local arch; arch=$(uname -m)
+    local url=""
+    [[ "$arch" == "x86_64" ]] && url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz"
+    [[ "$arch" == "aarch64" ]] && url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz"
+    
+    if [[ -n "$url" ]]; then
+       local tmpdir; tmpdir=$(mktemp -d)
+       curl -L -o "$tmpdir/speedtest.tgz" "$url"
+       tar -xzf "$tmpdir/speedtest.tgz" -C "$tmpdir"
+       if [[ -f "$tmpdir/speedtest" ]]; then
+         mv "$tmpdir/speedtest" /usr/bin/speedtest
+         chmod +x /usr/bin/speedtest
+         installed=1
+       fi
+       rm -rf "$tmpdir"
+    fi
+  fi
+  
+  if [[ "$installed" -eq 0 ]]; then
+    echo -e "${RED}Speedtest 安装失败。请检查网络或手动安装。${PLAIN}"
+    return 1
+  fi
 }
 
-# ==================================================
-# Menu
-# ==================================================
+run_ookla_speedtest(){
+  if ! command -v speedtest >/dev/null 2>&1; then install_ookla_speedtest || return; fi
+  
+  echo -e "\n${BLUE}========== Speedtest by Ookla ==========${PLAIN}"
+  echo -e "你可以直接回车使用自动节点，或输入 Server ID 指定节点。"
+  read -p "Server ID (可选): " sid
+
+  # 首次运行自动接受协议
+  if [[ ! -f ~/.config/ookla/speedtest-cli.json ]]; then
+    speedtest --accept-license --accept-gdpr >/dev/null 2>&1
+  fi
+
+  echo -e "${CYAN}正在启动测速引擎...${PLAIN}\n"
+  
+  if [[ -n "$sid" ]]; then
+    speedtest --server-id="$sid" --progress=yes
+  else
+    speedtest --progress=yes
+  fi
+  echo -e "${BLUE}========================================${PLAIN}"
+}
+
+# ----------------- 8) Live Monitor (New!) -----------------
+monitor_stats(){
+  # 这是一个实时刷新的函数
+  while true; do
+    clear
+    echo -e "${BLUE}=== 实时流量监控 (Ctrl+C 退出) ===${PLAIN}"
+    echo -e "时间: $(date +%T)"
+    echo -e "------------------------------------------------------------------"
+    printf "%-8s %-8s %-5s %-10s %-15s %-15s\n" "TYPE" "TARGET" "DIR" "RATE" "SENT TOTAL" "DROPPED"
+    echo -e "------------------------------------------------------------------"
+    
+    if [[ ! -s "$DB_FILE" ]]; then
+      echo -e "${YELLOW}   (当前无任何限速规则)${PLAIN}"
+    else
+      while IFS='|' read -r type key dir mbps ts meta; do
+         local dev="$INTERFACE"
+         local classid=""
+         local sent="-"
+         local dropped="-"
+         
+         if [[ "$type" == "XRAY" && "$dir" == "out" ]]; then classid="1:200"; fi
+         if [[ "$type" == "XRAY" && "$dir" == "in" ]]; then dev="$IFB_DEV"; classid="1:201"; fi
+         if [[ "$type" == "PORT" ]]; then
+             local m; m="$(echo "$meta" | grep -o "minor=[0-9a-f]*" | cut -d= -f2)"
+             [[ -n "$m" ]] && classid="1:$m"
+             [[ "$dir" == "in" ]] && dev="$IFB_DEV"
+         fi
+
+         if [[ -n "$classid" ]]; then
+           # 解析 tc -s 输出
+           local raw
+           raw="$(tc -s class show dev "$dev" classid "$classid" 2>/dev/null)"
+           if [[ -n "$raw" ]]; then
+             # 提取 Sent 字节
+             local bytes; bytes="$(echo "$raw" | grep -oP 'Sent \K[0-9]+' | head -1)"
+             if [[ -n "$bytes" ]]; then
+               # 简单单位转换
+               if [[ "$bytes" -gt 1073741824 ]]; then sent="$(awk -v b="$bytes" 'BEGIN{printf "%.2f G", b/1073741824}')"
+               elif [[ "$bytes" -gt 1048576 ]]; then sent="$(awk -v b="$bytes" 'BEGIN{printf "%.2f M", b/1048576}')"
+               else sent="${bytes} B"; fi
+             fi
+             # 提取 Dropped 包
+             local drop; drop="$(echo "$raw" | grep -oP 'dropped \K[0-9]+' | head -1)"
+             [[ -n "$drop" ]] && dropped="$drop"
+             [[ "$dropped" != "0" ]] && dropped="${RED}${dropped}${PLAIN}" # 丢包标红
+           fi
+         fi
+         
+         printf "%-8s %-8s %-5s %-10s %-15s %-15s\n" "$type" "$key" "$dir" "${mbps}M" "$sent" "$dropped"
+      done < "$DB_FILE"
+    fi
+    echo -e "------------------------------------------------------------------"
+    echo -e "${YELLOW}提示：Dropped > 0 表示限速正在生效并丢弃多余数据包${PLAIN}"
+    sleep 2
+  done
+}
+
+# ----------------- 9) Uninstall -----------------
+do_uninstall(){
+  echo -e "${RED}警告：这将清除所有限速规则并删除脚本配置文件！${PLAIN}"
+  read -p "确定要继续吗? (y/N): " confirm
+  [[ "$confirm" != "y" ]] && return
+  
+  reset_all
+  rm -rf "$STATE_DIR"
+  
+  echo -e "${GREEN}卸载完成。${PLAIN}"
+  echo -e "你可以手动删除此脚本: rm $0"
+  exit 0
+}
+
+# ----------------- Menu -----------------
 show_menu(){
   clear
   echo -e "=================================================="
-  echo -e "   VPS 流量控制台 V10.5（ASCII 进度条测速版）"
+  echo -e "   VPS 流量控制台 V10.7 (Pro)"
   echo -e "   网卡: ${GREEN}${INTERFACE}${PLAIN} | IFB: ${GREEN}${IFB_DEV}${PLAIN}"
-  echo -e "   nftables: $(has_nft && echo -e "${GREEN}OK${PLAIN}" || echo -e "${YELLOW}缺失(建议安装)${PLAIN}")"
+  echo -e "   nftables: $(has_nft && echo -e "${GREEN}OK${PLAIN}" || echo -e "${YELLOW}缺失${PLAIN}")"
   echo -e "=================================================="
-  echo -e "1. 监听目前所有端口 (TCP/UDP，支持编号点选)"
-  echo -e "2. 限制 Xray 总出站/总入站速度（可分开设置）"
-  echo -e "3. 限制 特定端口 速率（上下行可分开设置）"
-  echo -e "4. 查看当前所有端口/项目的限速情况（清单）"
-  echo -e "5. 移除 Xray 的限速（入站/出站）"
-  echo -e "6. 全部重置（恢复脚本修改的所有项目）"
-  echo -e "7. Speedtest 测速（指定端口；固定 500MB；ASCII 进度条）"
+  echo -e "1. 监听端口 (列表展示)"
+  echo -e "2. 限制 Xray 速度 (Docker/UID 增强版)"
+  echo -e "3. 限制 特定端口 速率 (手动输入)"
+  echo -e "4. 查看限速清单"
+  echo -e "5. 移除 Xray 限速"
+  echo -e "6. 全部重置 (Reset)"
+  echo -e "--------------------------------------------------"
+  echo -e "7. Speedtest (Ookla 官方版 + 节点选择)"
+  echo -e "8. 实时流量监控面板 (Live Monitor)"
+  echo -e "9. 彻底卸载与清理"
   echo -e "0. 退出"
   echo -e "=================================================="
   read -p "选择: " c
@@ -668,7 +608,9 @@ show_menu(){
     4) show_limits; read -p "回车返回..." ;;
     5) menu_remove_xray_limits; read -p "回车返回..." ;;
     6) reset_all; read -p "回车返回..." ;;
-    7) speedtest_fixed_500mb; read -p "回车返回..." ;;
+    7) run_ookla_speedtest; read -p "回车返回..." ;;
+    8) monitor_stats ;;
+    9) do_uninstall ;;
     0) exit 0 ;;
     *) show_menu ;;
   esac
