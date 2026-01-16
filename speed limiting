@@ -1,11 +1,13 @@
 #!/bin/bash
 
 # ==================================================
-# VPS 流量控制台 V8.3 (Interactive - IFB Shaping, Dual-Stack, Flower Preferred)
-# 修复：
-# - 有时端口限不住：补齐 IPv6 + 使用 flower 分类器（更稳定）
-# - TCP/UDP 全覆盖：同端口对 TCP/UDP 都加规则
-# - 入方向不再 police drop：IFB shaping（避免“像断网”）
+# VPS 流量控制台 V8.4 (IFB Shaping, Dual-Stack, Precise Shaping)
+# - 精准限速：HTB class + (TBF -> fq_codel) 叶子队列，目标误差 <= 10%
+# - 支持 TCP/UDP 端口扫描
+# - 支持 IPv4/IPv6（flower 优先，IPv4 可回退 u32）
+# - 入方向：ingress redirect -> IFB shaping（不丢包，避免“像断网”）
+# - 新增：查看当前所有端口限速情况（出/入/双向）
+# - Debian/Ubuntu 兼容性加强
 # ==================================================
 
 RED='\033[31m'
@@ -16,77 +18,64 @@ PLAIN='\033[0m'
 
 [[ $EUID -ne 0 ]] && echo -e "${RED}错误：请使用 root 用户运行！${PLAIN}" && exit 1
 
-for cmd in ip tc ss awk grep printf uname curl tar modprobe; do
+# ---- deps ----
+for cmd in ip tc ss awk grep printf uname curl tar modprobe sed cut tr; do
   command -v "$cmd" >/dev/null 2>&1 || { echo -e "${RED}缺少命令: $cmd${PLAIN}"; exit 1; }
 done
 
+# ---- interface ----
 INTERFACE=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')
 [[ -z "$INTERFACE" ]] && echo -e "${RED}错误：无法自动识别网卡，请检查路由/网络。${PLAIN}" && exit 1
 
 IFB_DEV="ifb0"
 
+# ---- tc params ----
 USER_QUANTUM=15000
 ROOT_QUANTUM=200000
 
 DEFAULT_MINOR_HEX="fffe"
 DEFAULT_CLASSID="1:${DEFAULT_MINOR_HEX}"
-DEFAULT_HANDLE="fffe:"
+DEFAULT_HANDLE="fffe:" # fq_codel on default
 
-PORT_CLASS_OFFSET=4096
-ROOT_RATE="10000mbit"
-DEFAULT_BURST="1m"
+PORT_CLASS_OFFSET=4096          # port -> minor mapping offset
+ROOT_RATE="10000mbit"           # effectively "unlimited"
+DEFAULT_BURST="1m"              # HTB burst
+TBF_LATENCY_MS=50               # TBF latency target
+TBF_MIN_BURST_BYTES=32768       # burst too small causes jitter; keep >= 32KB
 
 SELECTED_PORT=""
 
-# ----------------- utils -----------------
+# ==================================================
+# Utils
+# ==================================================
 is_number() { [[ "$1" =~ ^[0-9]+$ ]]; }
 
-port_to_hex_minor() {
-  local port="$1"
-  local minor=$((port + PORT_CLASS_OFFSET))
-  printf '%x' "$minor"
-}
+port_to_minor_dec() { echo $(( $1 + PORT_CLASS_OFFSET )); }
+port_to_hex_minor() { printf '%x' "$(port_to_minor_dec "$1")"; }
 
+hex_to_dec() { printf "%d" "0x$1"; }
+
+# best-effort tc wrapper (avoid script hard crash)
+tc_try() { tc "$@" >/dev/null 2>&1; return 0; }
+
+# detect flower (best effort)
 has_flower() {
-  # flower 是内核模块/功能，不好“查询”，用一次无害的命令探测最靠谱
-  # 这里只做轻量判断：tc help 里通常会出现 flower（不同版本不一定）
   tc filter help 2>/dev/null | grep -qi flower
 }
 
-# 统一：幂等地创建 HTB 树 + 默认类 fq_codel
-init_htb_tree() {
-  local dev="$1"
-
-  if ! tc qdisc show dev "$dev" 2>/dev/null | grep -q "htb 1:"; then
-    tc qdisc add dev "$dev" root handle 1: htb default "$DEFAULT_MINOR_HEX" r2q 10 2>/dev/null || true
-  else
-    tc qdisc replace dev "$dev" root handle 1: htb default "$DEFAULT_MINOR_HEX" r2q 10 2>/dev/null || true
-  fi
-
-  if ! tc class show dev "$dev" 2>/dev/null | grep -q "1:1 "; then
-    tc class add dev "$dev" parent 1: classid 1:1 htb rate "$ROOT_RATE" quantum "$ROOT_QUANTUM" 2>/dev/null || true
-  else
-    tc class replace dev "$dev" parent 1: classid 1:1 htb rate "$ROOT_RATE" quantum "$ROOT_QUANTUM" 2>/dev/null || true
-  fi
-
-  if ! tc class show dev "$dev" 2>/dev/null | grep -q "${DEFAULT_CLASSID} "; then
-    tc class add dev "$dev" parent 1:1 classid "$DEFAULT_CLASSID" htb rate "$ROOT_RATE" quantum "$ROOT_QUANTUM" 2>/dev/null || true
-  else
-    tc class replace dev "$dev" parent 1:1 classid "$DEFAULT_CLASSID" htb rate "$ROOT_RATE" quantum "$ROOT_QUANTUM" 2>/dev/null || true
-  fi
-
-  tc qdisc replace dev "$dev" parent "$DEFAULT_CLASSID" handle "$DEFAULT_HANDLE" fq_codel 2>/dev/null || true
-}
-
+# ==================================================
+# IFB / Ingress redirect
+# ==================================================
 ensure_ifb() {
   modprobe ifb >/dev/null 2>&1 || true
 
   if ! ip link show "$IFB_DEV" >/dev/null 2>&1; then
     ip link add "$IFB_DEV" type ifb >/dev/null 2>&1 || {
-      echo -e "${RED}错误：创建 $IFB_DEV 失败（内核/权限/模块问题）。${PLAIN}"
+      echo -e "${RED}错误：创建 $IFB_DEV 失败（内核/模块/权限问题）。${PLAIN}"
       return 1
     }
   fi
+
   ip link set dev "$IFB_DEV" up >/dev/null 2>&1 || true
   return 0
 }
@@ -94,96 +83,175 @@ ensure_ifb() {
 ensure_ingress_redirect() {
   ensure_ifb || return 1
 
+  # ingress qdisc on physical NIC
   if ! tc qdisc show dev "$INTERFACE" 2>/dev/null | grep -q "ffff:"; then
-    tc qdisc add dev "$INTERFACE" handle ffff: ingress 2>/dev/null || true
+    tc_try qdisc add dev "$INTERFACE" handle ffff: ingress
   fi
 
-  # IPv4 redirect（prio 1）
+  # IPv4 redirect (prio 1)
   if ! tc filter show dev "$INTERFACE" parent ffff: 2>/dev/null | grep -q "protocol ip.*mirred.*redirect.*$IFB_DEV"; then
-    tc filter del dev "$INTERFACE" parent ffff: protocol ip prio 1 >/dev/null 2>&1 || true
+    tc_try filter del dev "$INTERFACE" parent ffff: protocol ip prio 1
     tc filter add dev "$INTERFACE" parent ffff: protocol ip prio 1 u32 \
-      match u32 0 0 action mirred egress redirect dev "$IFB_DEV" 2>/dev/null || {
+      match u32 0 0 action mirred egress redirect dev "$IFB_DEV" >/dev/null 2>&1 || {
         echo -e "${RED}错误：设置 IPv4 ingress redirect 失败。${PLAIN}"
         return 1
       }
   fi
 
-  # IPv6 redirect（prio 2）——这是你之前缺的“绕过点”
+  # IPv6 redirect (prio 2)
   if ! tc filter show dev "$INTERFACE" parent ffff: 2>/dev/null | grep -q "protocol ipv6.*mirred.*redirect.*$IFB_DEV"; then
-    tc filter del dev "$INTERFACE" parent ffff: protocol ipv6 prio 2 >/dev/null 2>&1 || true
+    tc_try filter del dev "$INTERFACE" parent ffff: protocol ipv6 prio 2
     tc filter add dev "$INTERFACE" parent ffff: protocol ipv6 prio 2 u32 \
-      match u32 0 0 action mirred egress redirect dev "$IFB_DEV" 2>/dev/null || {
+      match u32 0 0 action mirred egress redirect dev "$IFB_DEV" >/dev/null 2>&1 || {
         echo -e "${RED}错误：设置 IPv6 ingress redirect 失败。${PLAIN}"
-        return 1
+        echo -e "${YELLOW}提示：若内核/tc 不支持该写法，你仍可用 IPv4；IPv6 可能绕过限速。${PLAIN}"
+        # 不直接 return 1，避免把整套功能干掉（但会提示风险）
       }
   fi
 
   return 0
 }
 
+# ==================================================
+# HTB Tree init (per device)
+# ==================================================
+init_htb_tree() {
+  local dev="$1"
+
+  if ! tc qdisc show dev "$dev" 2>/dev/null | grep -q "htb 1:"; then
+    tc_try qdisc add dev "$dev" root handle 1: htb default "$DEFAULT_MINOR_HEX" r2q 10
+  else
+    tc_try qdisc replace dev "$dev" root handle 1: htb default "$DEFAULT_MINOR_HEX" r2q 10
+  fi
+
+  if ! tc class show dev "$dev" 2>/dev/null | grep -q "1:1 "; then
+    tc_try class add dev "$dev" parent 1: classid 1:1 htb rate "$ROOT_RATE" quantum "$ROOT_QUANTUM"
+  else
+    tc_try class replace dev "$dev" parent 1: classid 1:1 htb rate "$ROOT_RATE" quantum "$ROOT_QUANTUM"
+  fi
+
+  if ! tc class show dev "$dev" 2>/dev/null | grep -q "${DEFAULT_CLASSID} "; then
+    tc_try class add dev "$dev" parent 1:1 classid "$DEFAULT_CLASSID" htb rate "$ROOT_RATE" quantum "$ROOT_QUANTUM"
+  else
+    tc_try class replace dev "$dev" parent 1:1 classid "$DEFAULT_CLASSID" htb rate "$ROOT_RATE" quantum "$ROOT_QUANTUM"
+  fi
+
+  # default leaf qdisc: fq_codel
+  tc_try qdisc replace dev "$dev" parent "$DEFAULT_CLASSID" handle "$DEFAULT_HANDLE" fq_codel
+}
+
 init_all_trees() {
-  init_htb_tree "$INTERFACE"
+  init_htb_tree "$INTERFACE" || true
   ensure_ingress_redirect || return 1
-  init_htb_tree "$IFB_DEV"
+  init_htb_tree "$IFB_DEV" || true
   return 0
 }
 
-# ----- filter helpers -----
+# ==================================================
+# Precise leaf: TBF -> fq_codel
+# ==================================================
+# Make shaping more accurate: attach TBF as leaf to class, then fq_codel under TBF
+attach_precise_leaf() {
+  local dev="$1"
+  local classid="$2"      # e.g., 1:10abc
+  local handle_hex="$3"   # e.g., 10abc0
+  local rate_kbit="$4"
 
-# 删除指定 prio 的过滤规则（同时清理 ip/ipv6）
+  # tbf rate needs bytes burst. Choose burst based on rate.
+  # A practical burst: ~20ms of traffic (rate_kbit -> bytes per 20ms)
+  # bytes_per_sec = rate_kbit*1000/8
+  # burst_20ms = bytes_per_sec*0.02 = rate_kbit*1000/8*0.02 = rate_kbit*2.5
+  local burst_bytes=$(( rate_kbit * 25 / 10 ))
+  [[ "$burst_bytes" -lt "$TBF_MIN_BURST_BYTES" ]] && burst_bytes="$TBF_MIN_BURST_BYTES"
+
+  local latency="${TBF_LATENCY_MS}ms"
+  local tbf_handle="${handle_hex}:"
+  local inner_parent="${handle_hex}:1"
+
+  # Remove any existing leaf qdisc chain on this classid
+  tc_try qdisc del dev "$dev" parent "$classid"
+
+  # Attach TBF
+  tc qdisc add dev "$dev" parent "$classid" handle "$tbf_handle" tbf \
+    rate "${rate_kbit}kbit" burst "${burst_bytes}" latency "$latency" >/dev/null 2>&1 || {
+      # fallback: fq_codel only (still works but less precise)
+      tc_try qdisc replace dev "$dev" parent "$classid" handle "${handle_hex}f:" fq_codel
+      echo -e "${YELLOW}警告：$dev $classid TBF 创建失败，已回退为 fq_codel（精度可能下降）。${PLAIN}"
+      return 0
+    }
+
+  # Attach fq_codel under TBF
+  tc_try qdisc replace dev "$dev" parent "$inner_parent" handle "${handle_hex}f:" fq_codel
+}
+
+# ==================================================
+# Filters: flower preferred, IPv4 fallback u32, IPv6 requires flower (warn if not)
+# ==================================================
 del_prio_filters() {
   local dev="$1"
   local parent="$2"
   local prio="$3"
-  tc filter del dev "$dev" parent "$parent" protocol ip   prio "$prio" >/dev/null 2>&1 || true
-  tc filter del dev "$dev" parent "$parent" protocol ipv6 prio "$prio" >/dev/null 2>&1 || true
+  tc_try filter del dev "$dev" parent "$parent" protocol ip prio "$prio"
+  tc_try filter del dev "$dev" parent "$parent" protocol ipv6 prio "$prio"
 }
 
-# 尝试用 flower 添加分类规则；失败则回退 u32（IPv4 only 回退，IPv6 回退可能不支持端口匹配）
-add_classify_filter() {
-  local dev="$1"       # device
-  local parent="$2"    # parent 1:0
-  local proto="$3"     # ip / ipv6
-  local prio="$4"      # prio number
-  local l4="$5"        # tcp / udp
-  local dir="$6"       # out=in sport, in=dport
-  local port="$7"      # port number
-  local flowid="$8"    # classid like 1:abcd
-
-  # 先删同 prio，避免重复叠加
-  tc filter del dev "$dev" parent "$parent" protocol "$proto" prio "$prio" >/dev/null 2>&1 || true
-
-  # flower（更稳定、也能明确区分 tcp/udp）
-  # 说明：对于 TCP/UDP 都各加一条，命中率最高
+add_filter_one() {
+  local dev="$1" parent="$2" proto="$3" prio="$4" l4="$5" dir="$6" port="$7" flowid="$8"
+  # flower attempt
   if has_flower; then
     if [[ "$dir" == "out" ]]; then
       tc filter add dev "$dev" parent "$parent" protocol "$proto" prio "$prio" flower \
-        ip_proto "$l4" src_port "$port" flowid "$flowid" 2>/dev/null && return 0
+        ip_proto "$l4" src_port "$port" flowid "$flowid" >/dev/null 2>&1 && return 0
     else
       tc filter add dev "$dev" parent "$parent" protocol "$proto" prio "$prio" flower \
-        ip_proto "$l4" dst_port "$port" flowid "$flowid" 2>/dev/null && return 0
+        ip_proto "$l4" dst_port "$port" flowid "$flowid" >/dev/null 2>&1 && return 0
     fi
   fi
 
-  # 回退：u32（可靠性次一点，但 IPv4 通常够用）
+  # fallback u32 only for IPv4
   if [[ "$proto" == "ip" ]]; then
     if [[ "$dir" == "out" ]]; then
-      tc filter add dev "$dev" parent "$parent" protocol ip prio "$prio" u32 \
-        match ip protocol 6 0xff match ip sport "$port" 0xffff flowid "$flowid" 2>/dev/null && return 0
-      tc filter add dev "$dev" parent "$parent" protocol ip prio "$prio" u32 \
-        match ip protocol 17 0xff match ip sport "$port" 0xffff flowid "$flowid" 2>/dev/null && return 0
+      if [[ "$l4" == "tcp" ]]; then
+        tc filter add dev "$dev" parent "$parent" protocol ip prio "$prio" u32 \
+          match ip protocol 6 0xff match ip sport "$port" 0xffff flowid "$flowid" >/dev/null 2>&1 && return 0
+      else
+        tc filter add dev "$dev" parent "$parent" protocol ip prio "$prio" u32 \
+          match ip protocol 17 0xff match ip sport "$port" 0xffff flowid "$flowid" >/dev/null 2>&1 && return 0
+      fi
     else
-      tc filter add dev "$dev" parent "$parent" protocol ip prio "$prio" u32 \
-        match ip protocol 6 0xff match ip dport "$port" 0xffff flowid "$flowid" 2>/dev/null && return 0
-      tc filter add dev "$dev" parent "$parent" protocol ip prio "$prio" u32 \
-        match ip protocol 17 0xff match ip dport "$port" 0xffff flowid "$flowid" 2>/dev/null && return 0
+      if [[ "$l4" == "tcp" ]]; then
+        tc filter add dev "$dev" parent "$parent" protocol ip prio "$prio" u32 \
+          match ip protocol 6 0xff match ip dport "$port" 0xffff flowid "$flowid" >/dev/null 2>&1 && return 0
+      else
+        tc filter add dev "$dev" parent "$parent" protocol ip prio "$prio" u32 \
+          match ip protocol 17 0xff match ip dport "$port" 0xffff flowid "$flowid" >/dev/null 2>&1 && return 0
+      fi
     fi
+  else
+    # ipv6 without flower -> warn
+    echo -e "${YELLOW}提示：当前 tc/内核可能不支持 flower，IPv6 端口匹配可能无法生效（IPv6 可能绕过限速）。${PLAIN}"
   fi
 
   return 1
 }
 
-# ----------------- port picker (TCP/UDP) -----------------
+add_filters_tcp_udp_dualstack() {
+  local dev="$1" parent="$2" prio="$3" dir="$4" port="$5" flowid="$6"
+  # delete first (both protocols)
+  tc_try filter del dev "$dev" parent "$parent" protocol ip prio "$prio"
+  tc_try filter del dev "$dev" parent "$parent" protocol ipv6 prio "$prio"
+
+  # IPv4 TCP/UDP
+  add_filter_one "$dev" "$parent" "ip"   "$prio" "tcp" "$dir" "$port" "$flowid" >/dev/null 2>&1 || true
+  add_filter_one "$dev" "$parent" "ip"   "$prio" "udp" "$dir" "$port" "$flowid" >/dev/null 2>&1 || true
+  # IPv6 TCP/UDP (flower preferred)
+  add_filter_one "$dev" "$parent" "ipv6" "$prio" "tcp" "$dir" "$port" "$flowid" >/dev/null 2>&1 || true
+  add_filter_one "$dev" "$parent" "ipv6" "$prio" "udp" "$dir" "$port" "$flowid" >/dev/null 2>&1 || true
+}
+
+# ==================================================
+# Port selection & scan (TCP/UDP)
+# ==================================================
 function select_active_port() {
   echo -e "${YELLOW}[List] 正在扫描可操作端口(TCP/UDP)...${PLAIN}"
   echo -e "------------------------------------------------"
@@ -192,7 +260,7 @@ function select_active_port() {
 
   declare -a port_list
   declare -a proto_list
-  index=1
+  local index=1
 
   while read -r proto state localaddr _peer process; do
     if [[ "$proto" == "tcp" ]]; then
@@ -240,7 +308,6 @@ function select_active_port() {
   fi
 }
 
-# ----------------- status (TCP/UDP) -----------------
 function check_port_status() {
   clear
   echo -e "${YELLOW}[Scanning] 活跃端口深度扫描(TCP/UDP)...${PLAIN}"
@@ -273,9 +340,11 @@ function check_port_status() {
   echo -e "----------------------------------------------------------------------"
 }
 
-# ----------------- apply port limit (dual-stack, tcp+udp) -----------------
-function apply_port_limit() {
-  echo -e "\n${BLUE}--- 配置端口限速（V8.3 Dual-Stack + Flower）---${PLAIN}"
+# ==================================================
+# Apply limits
+# ==================================================
+apply_port_limit() {
+  echo -e "\n${BLUE}--- 配置端口限速（V8.4 精准模式）---${PLAIN}"
 
   select_active_port
   [[ -z "$SELECTED_PORT" ]] && return
@@ -291,7 +360,7 @@ function apply_port_limit() {
     1) direction="out" ;;
     2) direction="in" ;;
     3) direction="bi" ;;
-    *) echo -e "${RED}无效选项：默认双向${PLAIN}"; direction="bi" ;;
+    *) echo -e "${YELLOW}无效选项：默认双向${PLAIN}"; direction="bi" ;;
   esac
 
   read -p "请输入速率限制 (Mbps): " RATE_MBPS
@@ -300,63 +369,60 @@ function apply_port_limit() {
     return
   fi
 
+  # Use decimal Mbps -> kbit; for closer accuracy, avoid rounding too early
   RATE_KBIT=$((RATE_MBPS * 1000))
   BURST="$DEFAULT_BURST"
 
   HEX_ID=$(port_to_hex_minor "$PORT")
   CLASSID="1:${HEX_ID}"
-  HANDLE="${HEX_ID}0:"
+  HANDLE_HEX="${HEX_ID}0"         # for qdisc handles
 
   init_all_trees || { echo -e "${RED}初始化失败：IFB/redirect/HTB 未就绪。${PLAIN}"; return; }
 
   echo -e "${YELLOW}[Config] Port: $PORT  Rate: ${RATE_MBPS}Mbps  Class: $CLASSID${PLAIN}"
 
-  # --- Outbound (INTERFACE egress): src_port ---
+  # Outbound
   if [[ "$direction" == "out" || "$direction" == "bi" ]]; then
     del_prio_filters "$INTERFACE" "1:0" "$PORT"
-    tc qdisc del dev "$INTERFACE" parent "$CLASSID" >/dev/null 2>&1 || true
-    tc class del dev "$INTERFACE" parent 1:1 classid "$CLASSID" >/dev/null 2>&1 || true
+    tc_try qdisc del dev "$INTERFACE" parent "$CLASSID"
+    tc_try class del dev "$INTERFACE" parent 1:1 classid "$CLASSID"
 
     tc class add dev "$INTERFACE" parent 1:1 classid "$CLASSID" htb \
-      rate "${RATE_KBIT}kbit" ceil "${RATE_KBIT}kbit" burst "$BURST" quantum "$USER_QUANTUM" 2>/dev/null || \
+      rate "${RATE_KBIT}kbit" ceil "${RATE_KBIT}kbit" burst "$BURST" quantum "$USER_QUANTUM" >/dev/null 2>&1 || \
     tc class replace dev "$INTERFACE" parent 1:1 classid "$CLASSID" htb \
-      rate "${RATE_KBIT}kbit" ceil "${RATE_KBIT}kbit" burst "$BURST" quantum "$USER_QUANTUM" 2>/dev/null
+      rate "${RATE_KBIT}kbit" ceil "${RATE_KBIT}kbit" burst "$BURST" quantum "$USER_QUANTUM" >/dev/null 2>&1
 
-    tc qdisc replace dev "$INTERFACE" parent "$CLASSID" handle "$HANDLE" fq_codel 2>/dev/null || true
+    # precise leaf
+    attach_precise_leaf "$INTERFACE" "$CLASSID" "$HANDLE_HEX" "$RATE_KBIT"
 
-    # IPv4 + IPv6, TCP + UDP
-    add_classify_filter "$INTERFACE" "1:0" "ip"   "$PORT" "tcp" "out" "$PORT" "$CLASSID" >/dev/null 2>&1 || true
-    add_classify_filter "$INTERFACE" "1:0" "ip"   "$PORT" "udp" "out" "$PORT" "$CLASSID" >/dev/null 2>&1 || true
-    add_classify_filter "$INTERFACE" "1:0" "ipv6" "$PORT" "tcp" "out" "$PORT" "$CLASSID" >/dev/null 2>&1 || true
-    add_classify_filter "$INTERFACE" "1:0" "ipv6" "$PORT" "udp" "out" "$PORT" "$CLASSID" >/dev/null 2>&1 || true
+    # filters: dual-stack TCP/UDP
+    add_filters_tcp_udp_dualstack "$INTERFACE" "1:0" "$PORT" "out" "$PORT" "$CLASSID"
   fi
 
-  # --- Inbound (IFB egress): dst_port ---
+  # Inbound (on IFB)
   if [[ "$direction" == "in" || "$direction" == "bi" ]]; then
     del_prio_filters "$IFB_DEV" "1:0" "$PORT"
-    tc qdisc del dev "$IFB_DEV" parent "$CLASSID" >/dev/null 2>&1 || true
-    tc class del dev "$IFB_DEV" parent 1:1 classid "$CLASSID" >/dev/null 2>&1 || true
+    tc_try qdisc del dev "$IFB_DEV" parent "$CLASSID"
+    tc_try class del dev "$IFB_DEV" parent 1:1 classid "$CLASSID"
 
     tc class add dev "$IFB_DEV" parent 1:1 classid "$CLASSID" htb \
-      rate "${RATE_KBIT}kbit" ceil "${RATE_KBIT}kbit" burst "$BURST" quantum "$USER_QUANTUM" 2>/dev/null || \
+      rate "${RATE_KBIT}kbit" ceil "${RATE_KBIT}kbit" burst "$BURST" quantum "$USER_QUANTUM" >/dev/null 2>&1 || \
     tc class replace dev "$IFB_DEV" parent 1:1 classid "$CLASSID" htb \
-      rate "${RATE_KBIT}kbit" ceil "${RATE_KBIT}kbit" burst "$BURST" quantum "$USER_QUANTUM" 2>/dev/null
+      rate "${RATE_KBIT}kbit" ceil "${RATE_KBIT}kbit" burst "$BURST" quantum "$USER_QUANTUM" >/dev/null 2>&1
 
-    tc qdisc replace dev "$IFB_DEV" parent "$CLASSID" handle "$HANDLE" fq_codel 2>/dev/null || true
+    attach_precise_leaf "$IFB_DEV" "$CLASSID" "$HANDLE_HEX" "$RATE_KBIT"
 
-    # IPv4 + IPv6, TCP + UDP
-    add_classify_filter "$IFB_DEV" "1:0" "ip"   "$PORT" "tcp" "in" "$PORT" "$CLASSID" >/dev/null 2>&1 || true
-    add_classify_filter "$IFB_DEV" "1:0" "ip"   "$PORT" "udp" "in" "$PORT" "$CLASSID" >/dev/null 2>&1 || true
-    add_classify_filter "$IFB_DEV" "1:0" "ipv6" "$PORT" "tcp" "in" "$PORT" "$CLASSID" >/dev/null 2>&1 || true
-    add_classify_filter "$IFB_DEV" "1:0" "ipv6" "$PORT" "udp" "in" "$PORT" "$CLASSID" >/dev/null 2>&1 || true
+    add_filters_tcp_udp_dualstack "$IFB_DEV" "1:0" "$PORT" "in" "$PORT" "$CLASSID"
   fi
 
-  echo -e "${GREEN}[Success] 端口 $PORT 限速已生效（双栈 + TCP/UDP + flower 优先）。${PLAIN}"
+  echo -e "${GREEN}[Success] 端口 $PORT 限速已生效（TBF 精准整形，目标误差 <=10%）。${PLAIN}"
+  if ! has_flower; then
+    echo -e "${YELLOW}提示：检测到 flower 可能不可用，IPv6 端口限速可能不完整；建议安装/启用支持 flower 的内核/iptables/tc。${PLAIN}"
+  fi
 }
 
-# ----------------- global limit (dual shaping) -----------------
-function apply_global_limit() {
-  echo -e "\n${BLUE}--- 全局限速 (整机，出入均 shaping) ---${PLAIN}"
+apply_global_limit() {
+  echo -e "\n${BLUE}--- 全局限速 (整机，出入均精准整形) ---${PLAIN}"
   read -p "请输入总速率 (Mbps): " RATE_MBPS
   if ! is_number "$RATE_MBPS" || [[ "$RATE_MBPS" -le 0 ]]; then
     echo -e "${RED}错误：速率必须为正整数 Mbps${PLAIN}"
@@ -368,19 +434,79 @@ function apply_global_limit() {
 
   init_all_trees || { echo -e "${RED}初始化失败：IFB/redirect/HTB 未就绪。${PLAIN}"; return; }
 
-  tc class replace dev "$INTERFACE" parent 1:1 classid "$DEFAULT_CLASSID" htb \
-    rate "${RATE_KBIT}kbit" ceil "${RATE_KBIT}kbit" burst "$BURST" quantum "$USER_QUANTUM" 2>/dev/null || true
-  tc qdisc replace dev "$INTERFACE" parent "$DEFAULT_CLASSID" handle "$DEFAULT_HANDLE" fq_codel 2>/dev/null || true
+  # set default class rates
+  tc_try class replace dev "$INTERFACE" parent 1:1 classid "$DEFAULT_CLASSID" htb \
+    rate "${RATE_KBIT}kbit" ceil "${RATE_KBIT}kbit" burst "$BURST" quantum "$USER_QUANTUM"
+  # default leaf keep fq_codel (global precision is less strict; if you want, you can convert default to TBF too)
 
-  tc class replace dev "$IFB_DEV" parent 1:1 classid "$DEFAULT_CLASSID" htb \
-    rate "${RATE_KBIT}kbit" ceil "${RATE_KBIT}kbit" burst "$BURST" quantum "$USER_QUANTUM" 2>/dev/null || true
-  tc qdisc replace dev "$IFB_DEV" parent "$DEFAULT_CLASSID" handle "$DEFAULT_HANDLE" fq_codel 2>/dev/null || true
+  tc_try class replace dev "$IFB_DEV" parent 1:1 classid "$DEFAULT_CLASSID" htb \
+    rate "${RATE_KBIT}kbit" ceil "${RATE_KBIT}kbit" burst "$BURST" quantum "$USER_QUANTUM"
 
   echo -e "${GREEN}[Success] 全局限速已生效（出入均 shaping）。${PLAIN}"
 }
 
-# ----------------- remove -----------------
-function remove_limit() {
+# ==================================================
+# Show current limits (NEW)
+# ==================================================
+# Parse classes on device, list port-mapped classes and their rates
+list_limits_on_dev() {
+  local dev="$1"
+  local label="$2"
+
+  # Only show classes under parent 1:1 with classid 1:XXXX
+  # Example line: class htb 1:10d3 parent 1:1 prio 0 rate 20000Kbit ceil 20000Kbit burst ...
+  tc class show dev "$dev" 2>/dev/null | grep -E "class htb 1:" | while read -r line; do
+    echo "$line" | grep -q "parent 1:1" || continue
+    echo "$line" | grep -q "1:1 " && continue
+    echo "$line" | grep -q "1:${DEFAULT_MINOR_HEX} " && continue
+
+    classid=$(echo "$line" | awk '{print $3}')          # 1:10d3
+    minor_hex=$(echo "$classid" | awk -F':' '{print $2}')
+    rate_kbit=$(echo "$line" | sed -n 's/.* rate \([0-9]\+\)Kbit.*/\1/p')
+    [[ -z "$rate_kbit" ]] && rate_kbit="?"
+
+    # minor -> port
+    minor_dec=$(hex_to_dec "$minor_hex" 2>/dev/null)
+    port=$((minor_dec - PORT_CLASS_OFFSET))
+    [[ "$port" -le 0 || "$port" -gt 65535 ]] && continue
+
+    # Mbps display (keep 1 decimal)
+    if [[ "$rate_kbit" != "?" ]]; then
+      mbps_int=$((rate_kbit / 1000))
+      mbps_dec=$(( (rate_kbit % 1000) / 100 ))
+      rate_str="${mbps_int}.${mbps_dec} Mbps"
+    else
+      rate_str="?"
+    fi
+
+    printf "%-8s %-8s %-12s %-12s\n" "$label" "$port" "$classid" "$rate_str"
+  done
+}
+
+show_current_limits() {
+  clear
+  echo -e "${BLUE}--- 当前端口限速清单（出/入/双向）---${PLAIN}"
+  echo -e "说明：Outbound=物理网卡 egress；Inbound=IFB 入方向整形"
+  echo -e "------------------------------------------------------------"
+  printf "%-8s %-8s %-12s %-12s\n" "方向" "端口" "ClassID" "速率"
+  echo -e "------------------------------------------------------------"
+
+  # Build maps of port->rate for both directions so we can show BOTH nicely
+  # We'll print per-device and let user interpret; simple and reliable.
+  list_limits_on_dev "$INTERFACE" "Outbound"
+  list_limits_on_dev "$IFB_DEV"   "Inbound"
+
+  echo -e "------------------------------------------------------------"
+  echo -e "${YELLOW}提示：如果某端口只出现在 Outbound 或 Inbound，说明当前只限制了单向。${PLAIN}"
+  if ! has_flower; then
+    echo -e "${YELLOW}提示：flower 可能不可用，IPv6 流量可能绕过端口分类；建议优先确保 flower 可用。${PLAIN}"
+  fi
+}
+
+# ==================================================
+# Remove
+# ==================================================
+remove_limit() {
   echo -e "\n1. 解除指定端口 (可区分方向)"
   echo -e "2. 重置所有限制 (网卡级 + IFB + redirect 清理)"
   read -p "选择: " sel
@@ -404,24 +530,24 @@ function remove_limit() {
     case $rm_choice in
       1)
         del_prio_filters "$INTERFACE" "1:0" "$PORT"
-        tc qdisc del dev "$INTERFACE" parent "$CLASSID" >/dev/null 2>&1 || true
-        tc class del dev "$INTERFACE" parent 1:1 classid "$CLASSID" >/dev/null 2>&1 || true
+        tc_try qdisc del dev "$INTERFACE" parent "$CLASSID"
+        tc_try class del dev "$INTERFACE" parent 1:1 classid "$CLASSID"
         echo -e "${GREEN}端口 $PORT [下行] 限制已移除。${PLAIN}"
         ;;
       2)
         del_prio_filters "$IFB_DEV" "1:0" "$PORT"
-        tc qdisc del dev "$IFB_DEV" parent "$CLASSID" >/dev/null 2>&1 || true
-        tc class del dev "$IFB_DEV" parent 1:1 classid "$CLASSID" >/dev/null 2>&1 || true
+        tc_try qdisc del dev "$IFB_DEV" parent "$CLASSID"
+        tc_try class del dev "$IFB_DEV" parent 1:1 classid "$CLASSID"
         echo -e "${GREEN}端口 $PORT [上行] 限制已移除。${PLAIN}"
         ;;
       *)
         del_prio_filters "$INTERFACE" "1:0" "$PORT"
-        tc qdisc del dev "$INTERFACE" parent "$CLASSID" >/dev/null 2>&1 || true
-        tc class del dev "$INTERFACE" parent 1:1 classid "$CLASSID" >/dev/null 2>&1 || true
+        tc_try qdisc del dev "$INTERFACE" parent "$CLASSID"
+        tc_try class del dev "$INTERFACE" parent 1:1 classid "$CLASSID"
 
         del_prio_filters "$IFB_DEV" "1:0" "$PORT"
-        tc qdisc del dev "$IFB_DEV" parent "$CLASSID" >/dev/null 2>&1 || true
-        tc class del dev "$IFB_DEV" parent 1:1 classid "$CLASSID" >/dev/null 2>&1 || true
+        tc_try qdisc del dev "$IFB_DEV" parent "$CLASSID"
+        tc_try class del dev "$IFB_DEV" parent 1:1 classid "$CLASSID"
 
         echo -e "${GREEN}端口 $PORT [双向] 限制已全部移除。${PLAIN}"
         ;;
@@ -430,13 +556,13 @@ function remove_limit() {
     init_all_trees >/dev/null 2>&1 || true
 
   elif [[ "$sel" == "2" ]]; then
-    tc qdisc del dev "$INTERFACE" root >/dev/null 2>&1 || true
+    tc_try qdisc del dev "$INTERFACE" root
 
-    tc filter del dev "$INTERFACE" parent ffff: protocol ip   prio 1 >/dev/null 2>&1 || true
-    tc filter del dev "$INTERFACE" parent ffff: protocol ipv6 prio 2 >/dev/null 2>&1 || true
-    tc qdisc del dev "$INTERFACE" ingress >/dev/null 2>&1 || true
+    tc_try filter del dev "$INTERFACE" parent ffff: protocol ip prio 1
+    tc_try filter del dev "$INTERFACE" parent ffff: protocol ipv6 prio 2
+    tc_try qdisc del dev "$INTERFACE" ingress
 
-    tc qdisc del dev "$IFB_DEV" root >/dev/null 2>&1 || true
+    tc_try qdisc del dev "$IFB_DEV" root
 
     ip link set dev "$IFB_DEV" down >/dev/null 2>&1 || true
     ip link del "$IFB_DEV" >/dev/null 2>&1 || true
@@ -445,8 +571,10 @@ function remove_limit() {
   fi
 }
 
-# ----------------- speedtest -----------------
-function run_pro_speedtest() {
+# ==================================================
+# Speedtest
+# ==================================================
+run_pro_speedtest() {
   echo -e "${YELLOW}[Testing] Speedtest...${PLAIN}"
   if [ ! -f "./speedtest" ]; then
     ARCH=$(uname -m)
@@ -461,22 +589,24 @@ function run_pro_speedtest() {
   ./speedtest --accept-license --accept-gdpr
 }
 
-# ----------------- menu -----------------
-function show_menu() {
+# ==================================================
+# Menu
+# ==================================================
+show_menu() {
   clear
   echo -e "=================================================="
-  echo -e "       VPS 流量控制台 V8.3 (IFB Shaping, Dual-Stack, Flower)"
+  echo -e "       VPS 流量控制台 V8.4 (精准限速 + 清单查看)"
   echo -e "       物理网卡: ${GREEN}${INTERFACE}${PLAIN}"
   echo -e "       IFB 设备: ${GREEN}${IFB_DEV}${PLAIN}"
   echo -e "       默认类:   ${GREEN}${DEFAULT_CLASSID}${PLAIN}"
+  echo -e "       flower:   $(has_flower && echo -e "${GREEN}OK${PLAIN}" || echo -e "${YELLOW}可能不可用${PLAIN}")"
   echo -e "=================================================="
   echo -e "1. 查看活跃端口 (状态监控)"
-  echo -e "--------------------------------------------------"
-  echo -e "2. 设置 ${YELLOW}端口限速${PLAIN} (出入均 shaping，IPv4/IPv6，TCP/UDP)"
-  echo -e "3. 设置 ${RED}全局限速${PLAIN} (出入均 shaping)"
-  echo -e "--------------------------------------------------"
+  echo -e "2. 设置 ${YELLOW}端口限速${PLAIN} (精准：TBF->fq_codel)"
+  echo -e "3. 设置 ${RED}全局限速${PLAIN} (整机限制)"
   echo -e "4. 解除限制 / 重置 (含 IFB 清理)"
   echo -e "5. 运行测速 (Speedtest)"
+  echo -e "6. 查看当前所有端口限速清单 ${GREEN}[NEW]${PLAIN}"
   echo -e "0. 退出"
   echo -e "=================================================="
   read -p "选择: " choice
@@ -487,6 +617,7 @@ function show_menu() {
     3) apply_global_limit; read -p "回车返回..." ;;
     4) remove_limit; read -p "回车返回..." ;;
     5) run_pro_speedtest; read -p "回车返回..." ;;
+    6) show_current_limits; read -p "回车返回..." ;;
     0) exit 0 ;;
     *) show_menu ;;
   esac
