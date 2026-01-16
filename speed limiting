@@ -1,23 +1,5 @@
 #!/bin/bash
 # ==================================================
-# VPS 流量控制台 V10.12 (Fix: Remove Menu Display)
-#
-# 功能全集：
-# 1) 监听端口 (列表)
-# 2) 限制 Xray 速度 (Docker/UID)
-# 3) 限制 特定端口 速率 (序号点选)
-# 4) [修复] 移除 特定端口 限速 (显示详细信息)
-# 5) 查看限速清单
-# 6) 移除 Xray 限速
-# 7) 全部重置
-# 8) Speedtest by Ookla
-# 9) 实时流量监控
-# 10) 彻底卸载
-#
-# 修改记录 V10.12:
-# - [修复] 菜单4 报错问题 (cut命令管道符转义)
-# - [优化] 菜单4 现在显示端口的详细限速信息(方向/速率)
-# ==================================================
 
 set -u
 
@@ -429,7 +411,7 @@ menu_port_limit(){
   esac
 }
 
-# ----------------- 4) Port Limits (Remove) [FIXED] -----------------
+# ----------------- 4) Port Limits (Remove) [ENHANCED] -----------------
 remove_port_limit_exec(){
   local port="$1"
   local found=0
@@ -465,39 +447,51 @@ remove_port_limit_exec(){
 }
 
 menu_remove_port_limit(){
-  echo -e "\n${BLUE}--- 移除 特定端口 限速 ---${PLAIN}"
-  if [[ ! -s "$DB_FILE" ]]; then
-      echo -e "${YELLOW}(当前无端口限速记录)${PLAIN}"
-      return
-  fi
-  
-  # Check if there are any PORT records
-  if ! grep -q "^PORT|" "$DB_FILE"; then
+  echo -e "\n${BLUE}--- 移除 特定端口 限速 (支持序号点选) ---${PLAIN}"
+  if [[ ! -s "$DB_FILE" ]] || ! grep -q "^PORT|" "$DB_FILE"; then
       echo -e "${YELLOW}(当前无端口限速记录)${PLAIN}"
       return
   fi
 
-  echo -e "---------------------------------------"
-  printf "%-10s %-12s %-10s\n" "端口" "方向" "限速"
-  echo -e "---------------------------------------"
+  echo -e "--------------------------------------------------------"
+  printf "${GREEN}%-6s %-10s %-12s %-10s${PLAIN}\n" "序号" "端口" "方向" "限速"
+  echo -e "--------------------------------------------------------"
   
-  # Display Logic (Replaces faulty cut)
+  declare -a r_list_port
+  local idx=0
+  
   while IFS='|' read -r type port dir mbps ts meta; do
     if [[ "$type" == "PORT" ]]; then
+        idx=$((idx+1))
+        r_list_port[$idx]="$port"
+        
         local d_str="未知"
-        local d_color="$PLAIN"
-        if [[ "$dir" == "out" ]]; then d_str="out(下行)"; d_color="$GREEN"; fi
-        if [[ "$dir" == "in" ]]; then d_str="in(上行)"; d_color="$BLUE"; fi
-        printf "${GREEN}%-10s${PLAIN} ${d_color}%-12s${PLAIN} %-10s\n" "$port" "$d_str" "${mbps}Mbps"
+        if [[ "$dir" == "out" ]]; then d_str="out(下行)"; fi
+        if [[ "$dir" == "in" ]]; then d_str="in(上行)"; fi
+        
+        # 列表内容使用白色 (默认)
+        printf "[%d]    %-10s %-12s %-10s\n" "$idx" "$port" "$d_str" "${mbps}Mbps"
     fi
   done < "$DB_FILE"
-  echo -e "---------------------------------------"
+  echo -e "--------------------------------------------------------"
 
-  echo -e "${GREEN}[输入]${PLAIN} 请输入要移除限速的端口号:"
-  read -p "端口: " port
-  if ! is_number "$port"; then echo -e "${RED}端口无效${PLAIN}"; return; fi
+  echo -e "${GREEN}[输入]${PLAIN} 请输入序号(移除该条目端口的所有限制) 或 直接输入端口号:"
+  read -p "选择: " input_val
+  
+  local target_port=""
+  if [[ "$input_val" =~ ^[0-9]+$ ]] && [[ "$input_val" -le "$idx" ]] && [[ "$input_val" -gt 0 ]]; then
+      target_port="${r_list_port[$input_val]}"
+      # 如果输入的是序号，则从数组取值
+      if [[ -z "$target_port" ]]; then target_port="$input_val"; fi
+  else
+      target_port="$input_val"
+  fi
+
+  if ! is_number "$target_port"; then echo -e "${RED}输入无效${PLAIN}"; return; fi
+  
+  echo -e "即将移除端口 ${GREEN}${target_port}${PLAIN} 的所有限速规则..."
   init_all >/dev/null 2>&1 || true
-  remove_port_limit_exec "$port"
+  remove_port_limit_exec "$target_port"
 }
 
 # ----------------- 5) Show List -----------------
@@ -642,14 +636,14 @@ do_uninstall(){
 show_menu(){
   clear
   echo -e "=================================================="
-  echo -e "   VPS 流量控制台 V10.12 (Fix: Remove Menu Display)"
+  echo -e "   VPS 流量控制台 V10.13 (Menu 4 Enhanced)"
   echo -e "   网卡: ${GREEN}${INTERFACE}${PLAIN} | IFB: ${GREEN}${IFB_DEV}${PLAIN}"
   echo -e "   nftables: $(has_nft && echo -e "${GREEN}OK${PLAIN}" || echo -e "${YELLOW}缺失${PLAIN}")"
   echo -e "=================================================="
   echo -e "1. 监听端口 (纯列表)"
   echo -e "2. 限制 Xray 速度 (Docker/UID)"
   echo -e "3. 限制 特定端口 速率 (序号点选)"
-  echo -e "4. ${GREEN}移除 特定端口 限速${PLAIN} (详细)"
+  echo -e "4. ${GREEN}移除 特定端口 限速${PLAIN} (支持序号)"
   echo -e "5. 查看限速清单"
   echo -e "6. 移除 Xray 限速"
   echo -e "7. 全部重置 (Reset)"
