@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==================================================
-# VPS 流量控制台 V10.4 (3x-ui / Xray + Per-Port Shaping + UI-like Speedtest)
+# VPS 流量控制台 V10.5 (3x-ui / Xray + Per-Port Shaping + ASCII Speedtest Bar)
 #
 # 功能：
 # 1) 监听目前所有端口（TCP/UDP，支持编号点选）
@@ -9,12 +9,12 @@
 # 4) 查看当前所有端口/项目的限速情况（清单）
 # 5) 移除 Xray 的限速（入站/出站）
 # 6) 全部重置（恢复脚本修改的所有项目）
-# 7) Speedtest（指定端口；固定 500MB；上下行分开；“更像测速UI”的进度显示）
+# 7) Speedtest（指定端口；固定 500MB；上下行分开；ASCII 块状进度条）
 # 0) 退出
 #
 # 关键修复：
-# - 修复 classid/handle 溢出导致的 “创建 TBF 失败”：改用 minor 分配器，保证 <= fffd
-# - Speedtest：保留进度输出（stderr），耗时写临时文件避免破坏进度显示
+# - 修复 classid/handle 溢出导致的 “创建 TBF 失败”：使用 minor 分配器，保证 <= fffd
+# - Speedtest：使用 curl -#（ASCII 进度条）；耗时写临时文件避免破坏进度条
 # ==================================================
 
 set -u
@@ -89,7 +89,7 @@ run_or_fail(){
 db_upsert(){
   local type="$1" key="$2" dir="$3" mbps="$4" meta="$5"
   local ts; ts="$(date +%F_%T)"
-  grep -vE "^${type}\|${key}\|${dir}\|" "$DB_FILE" > "${DB_FILE}.tmp" 2>/dev.glide || true
+  grep -vE "^${type}\|${key}\|${dir}\|" "$DB_FILE" > "${DB_FILE}.tmp" 2>/dev/null || true
   mv -f "${DB_FILE}.tmp" "$DB_FILE" >/dev/null 2>&1 || true
   echo "${type}|${key}|${dir}|${mbps}|${ts}|${meta}" >> "$DB_FILE"
 }
@@ -189,7 +189,7 @@ attach_precise_leaf(){
   local tbf_handle="${handle_major_hex}:"
   local inner_parent="${handle_major_hex}:1"
 
-  tc qdisc del dev "$dev" parent "$classid" >/dev/null 2>&1 || true
+  tc qdisc del dev "$dev" parent "$classid" >/dev/null 2>&1 || seevde true
   run_or_fail "在 $dev/$classid 创建 TBF 失败" tc qdisc add dev "$dev" parent "$classid" handle "$tbf_handle" tbf \
     rate "${rate_kbit}kbit" burst "${burst_bytes}" latency "$latency" || return 1
   tc qdisc replace dev "$dev" parent "$inner_parent" handle "${handle_major_hex}f:" fq_codel >/dev/null 2>&1 || true
@@ -592,7 +592,7 @@ reset_all(){
 }
 
 # ==================================================
-# 7) Speedtest UI-like (fixed 500MB, progress)
+# 7) Speedtest (ASCII bar, fixed 500MB, split)
 # ==================================================
 calc_mbps(){
   local bytes="$1" sec="$2"
@@ -600,7 +600,7 @@ calc_mbps(){
 }
 
 speedtest_fixed_500mb(){
-  echo -e "\n${BLUE}--- Speedtest（固定 500MB，上下行分开，“测速UI”风格进度）---${PLAIN}"
+  echo -e "\n${BLUE}--- Speedtest（固定 500MB，上下行分开，ASCII 块状进度条）---${PLAIN}"
   read -p "测试主机(默认 speed.cloudflare.com): " host
   [[ -z "$host" ]] && host="speed.cloudflare.com"
 
@@ -622,8 +622,9 @@ speedtest_fixed_500mb(){
   utmp="$(mktemp /tmp/vps-tc-ul.XXXXXX)"
 
   echo -e "${YELLOW}下载测试中...${PLAIN} (${SPEEDTEST_MB}MB via ${host}:${port})"
-  # UI-like：用 --progress-bar（比 -# 信息更完整），进度走 stderr（必须保留）
-  curl --progress-bar -o /dev/null --connect-timeout 8 --max-time 600 -w "%{time_total}" "$down_url" >"$dtmp"
+  # 关键：ASCII 进度条走 stderr（不要重定向 stderr）
+  # 耗时通过 stdout 写临时文件，避免破坏进度条显示
+  curl -# -o /dev/null --connect-timeout 8 --max-time 600 -w "%{time_total}" "$down_url" >"$dtmp"
   local dtime; dtime="$(cat "$dtmp" 2>/dev/null)"
   rm -f "$dtmp" >/dev/null 2>&1 || true
   local dMbps; dMbps="$(calc_mbps "$SPEEDTEST_BYTES" "$dtime")"
@@ -631,7 +632,7 @@ speedtest_fixed_500mb(){
 
   echo -e "${YELLOW}上传测试中...${PLAIN} (${SPEEDTEST_MB}MB via ${host}:${port})"
   head -c "$SPEEDTEST_BYTES" </dev/zero | \
-    curl --progress-bar -o /dev/null --connect-timeout 8 --max-time 600 -w "%{time_total}" \
+    curl -# -o /dev/null --connect-timeout 8 --max-time 600 -w "%{time_total}" \
       -X POST --data-binary @- "$up_url" >"$utmp"
   local utime; utime="$(cat "$utmp" 2>/dev/null)"
   rm -f "$utmp" >/dev/null 2>&1 || true
@@ -645,7 +646,7 @@ speedtest_fixed_500mb(){
 show_menu(){
   clear
   echo -e "=================================================="
-  echo -e "   VPS 流量控制台 V10.4（端口限速+测速UI进度）"
+  echo -e "   VPS 流量控制台 V10.5（ASCII 进度条测速版）"
   echo -e "   网卡: ${GREEN}${INTERFACE}${PLAIN} | IFB: ${GREEN}${IFB_DEV}${PLAIN}"
   echo -e "   nftables: $(has_nft && echo -e "${GREEN}OK${PLAIN}" || echo -e "${YELLOW}缺失(建议安装)${PLAIN}")"
   echo -e "=================================================="
@@ -655,7 +656,7 @@ show_menu(){
   echo -e "4. 查看当前所有端口/项目的限速情况（清单）"
   echo -e "5. 移除 Xray 的限速（入站/出站）"
   echo -e "6. 全部重置（恢复脚本修改的所有项目）"
-  echo -e "7. Speedtest 测速（指定端口；固定 500MB；上下行分开；进度条）"
+  echo -e "7. Speedtest 测速（指定端口；固定 500MB；ASCII 进度条）"
   echo -e "0. 退出"
   echo -e "=================================================="
   read -p "选择: " c
