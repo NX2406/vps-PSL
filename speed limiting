@@ -1,5 +1,23 @@
 #!/bin/bash
 # ==================================================
+# VPS 流量控制台 V10.14 (Speedtest Nodes + Menu Fix)
+#
+# 功能全集：
+# 1) 监听端口 (列表)
+# 2) 限制 Xray 速度 (Docker/UID)
+# 3) 限制 特定端口 速率 (序号点选)
+# 4) 移除 特定端口 限速 (支持序号, 白色字体)
+# 5) 查看限速清单
+# 6) 移除 Xray 限速
+# 7) 全部重置
+# 8) [升级] Speedtest (内置20+热门节点列表)
+# 9) 实时流量监控
+# 10) 彻底卸载
+#
+# 修改记录 V10.14:
+# - [修复] 主菜单第4项字体颜色改为白色
+# - [新增] Speedtest 增加20个常用节点选择菜单
+# ==================================================
 
 set -u
 
@@ -542,7 +560,7 @@ reset_all(){
   echo -e "${GREEN}已重置所有 TC/NFT 规则${PLAIN}"
 }
 
-# ----------------- 8) Speedtest -----------------
+# ----------------- 8) Speedtest (Enhanced) -----------------
 install_ookla_speedtest(){
   echo -e "${YELLOW}检测到未安装 speedtest，正在安装...${PLAIN}"
   local installed=0
@@ -571,10 +589,59 @@ install_ookla_speedtest(){
 
 run_ookla_speedtest(){
   if ! command -v speedtest >/dev/null 2>&1; then install_ookla_speedtest || { echo -e "${RED}安装失败${PLAIN}"; return; }; fi
+  
   echo -e "\n${BLUE}========== Speedtest by Ookla ==========${PLAIN}"
-  read -p "Server ID (可选, 回车自动): " sid
+  echo -e "${YELLOW}热门节点推荐 (输入序号或ID):${PLAIN}"
+  echo -e "----------------------------------------"
+  echo -e "1)  3633    (中国电信 | 上海)"
+  echo -e "2)  27594   (中国电信 | 南京)"
+  echo -e "3)  27377   (中国电信 | 合肥)"
+  echo -e "4)  24447   (中国联通 | 上海)"
+  echo -e "5)  4870    (中国联通 | 长沙)"
+  echo -e "6)  16803   (中国移动 | 上海)"
+  echo -e "7)  25858   (中国移动 | 北京)"
+  echo -e "----------------------------------------"
+  echo -e "8)  13538   (香港 | STC)"
+  echo -e "9)  1536    (香港 | CSL)"
+  echo -e "10) 21569   (日本 | Tokyo IPA)"
+  echo -e "11) 48463   (日本 | Rakuten)"
+  echo -e "12) 13623   (新加坡 | Singtel)"
+  echo -e "13) 17383   (美国 | Los Angeles)"
+  echo -e "14) 14236   (美国 | San Jose)"
+  echo -e "15) 31120   (德国 | Frankfurt)"
+  echo -e "----------------------------------------"
+  
+  read -p "请输入序号/ID (直接回车自动): " selection
+  
+  local sid=""
+  case "$selection" in
+    1) sid="3633" ;;
+    2) sid="27594" ;;
+    3) sid="27377" ;;
+    4) sid="24447" ;;
+    5) sid="4870" ;;
+    6) sid="16803" ;;
+    7) sid="25858" ;;
+    8) sid="13538" ;;
+    9) sid="1536" ;;
+    10) sid="21569" ;;
+    11) sid="48463" ;;
+    12) sid="13623" ;;
+    13) sid="17383" ;;
+    14) sid="14236" ;;
+    15) sid="31120" ;;
+    "") sid="" ;;
+    *) sid="$selection" ;; # 手动输入ID
+  esac
+
   if [[ ! -f ~/.config/ookla/speedtest-cli.json ]]; then speedtest --accept-license --accept-gdpr >/dev/null 2>&1; fi
-  if [[ -n "$sid" ]]; then speedtest --server-id="$sid" --progress=yes; else speedtest --progress=yes; fi
+  
+  echo -e "${CYAN}正在连接测速服务器...${PLAIN}\n"
+  if [[ -n "$sid" ]]; then 
+      speedtest --server-id="$sid" --progress=yes
+  else 
+      speedtest --progress=yes
+  fi
   echo -e "${BLUE}========================================${PLAIN}"
 }
 
@@ -636,19 +703,19 @@ do_uninstall(){
 show_menu(){
   clear
   echo -e "=================================================="
-  echo -e "   VPS 流量控制台 V10.13 (Menu 4 Enhanced)"
+  echo -e "   VPS 流量控制台 V10.14 (Speedtest Nodes + Menu Fix)"
   echo -e "   网卡: ${GREEN}${INTERFACE}${PLAIN} | IFB: ${GREEN}${IFB_DEV}${PLAIN}"
   echo -e "   nftables: $(has_nft && echo -e "${GREEN}OK${PLAIN}" || echo -e "${YELLOW}缺失${PLAIN}")"
   echo -e "=================================================="
-  echo -e "1. 监听端口 (纯列表)"
+  echo -e "1. 监听端口 (列表)"
   echo -e "2. 限制 Xray 速度 (Docker/UID)"
   echo -e "3. 限制 特定端口 速率 (序号点选)"
-  echo -e "4. ${GREEN}移除 特定端口 限速${PLAIN} (支持序号)"
+  echo -e "4. 移除 特定端口 限速 (支持序号)"
   echo -e "5. 查看限速清单"
   echo -e "6. 移除 Xray 限速"
   echo -e "7. 全部重置 (Reset)"
   echo -e "--------------------------------------------------"
-  echo -e "8. Speedtest (Ookla 官方版)"
+  echo -e "8. Speedtest (含20+精选节点)"
   echo -e "9. 实时流量监控 (Live Monitor)"
   echo -e "10. 彻底卸载与清理"
   echo -e "0. 退出"
