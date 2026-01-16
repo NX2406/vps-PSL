@@ -1,63 +1,454 @@
 #!/bin/bash
-# ==========================================
-# 网络协议栈深度复位工具 (终极版)
-# ==========================================
 
-# 1. 锁定网卡
-IFACE=$(ip route get 8.8.8.8 | awk '{print $5; exit}')
-echo ">>> 当前网卡: $IFACE"
+# ==================================================
+# VPS 流量控制台 V8.2 (Interactive - IFB Shaping)
+# 特性：
+# - 端口列表点选
+# - 下行(outbound) HTB shaping（物理网卡 egress）
+# - 上行(inbound) IFB + HTB shaping（不再 police drop，避免“像断网/卡死”）
+# - classid 冲突规避：default=1:fffe；端口 minor=PORT+4096
+# - 默认类/端口类挂 fq_codel（更稳）
+# ==================================================
 
-# 2. 诊断：看看是不是还有 TC 规则在潜伏
-echo -e "\n[1/5] 正在检查残留的限速规则..."
-TC_CHECK=$(tc qdisc show dev $IFACE)
-if [[ $TC_CHECK == *"htb"* || $TC_CHECK == *"sfq"* || $TC_CHECK == *"ingress"* ]]; then
-    echo "警告：发现顽固规则！正在暴力清除..."
-    tc qdisc del dev $IFACE root >/dev/null 2>&1
-    tc qdisc del dev $IFACE ingress >/dev/null 2>&1
-    echo ">>> 清除完毕。"
-else
-    echo ">>> 未发现 TC 限速规则 (说明限速本身已解除)。"
-fi
+# 颜色定义
+RED='\033[31m'
+GREEN='\033[32m'
+YELLOW='\033[33m'
+BLUE='\033[36m'
+PLAIN='\033[0m'
 
-# 3. 诊断：检查防火墙是否被脚本修改
-echo -e "\n[2/5] 正在重置防火墙规则 (防止丢包策略残留)..."
-# 备份一下防止误删关键规则，但为了恢复通常建议全清
-iptables -P INPUT ACCEPT
-iptables -P FORWARD ACCEPT
-iptables -P OUTPUT ACCEPT
-iptables -t nat -F
-iptables -t mangle -F
-iptables -F
-iptables -X
-echo ">>> 防火墙已重置为全放行状态。"
+# 检查 root
+[[ $EUID -ne 0 ]] && echo -e "${RED}错误：请使用 root 用户运行！${PLAIN}" && exit 1
 
-# 4. 诊断：检查网卡 MTU 和 队列长度
-echo -e "\n[3/5] 正在恢复网卡物理参数..."
-ip link set dev $IFACE mtu 1500
-if command -v ethtool &>/dev/null; then
-    ethtool -K $IFACE tso on gso on gro on >/dev/null 2>&1
-fi
-echo ">>> 网卡 MTU/Offload 已恢复默认。"
+# 依赖检查
+for cmd in ip tc ss awk grep printf uname curl tar modprobe; do
+  command -v "$cmd" >/dev/null 2>&1 || { echo -e "${RED}缺少命令: $cmd${PLAIN}"; exit 1; }
+done
 
-# 5. 诊断：清理可能存在的残留文件
-echo -e "\n[4/5] 检查开机自启残留..."
-# 检查 rc.local 中是否还有 limit.sh
-if [ -f /etc/rc.local ]; then
-    if grep -q "limit.sh" /etc/rc.local; then
-        echo "警告：发现 rc.local 中有脚本残留，正在剔除..."
-        sed -i '/limit.sh/d' /etc/rc.local
+# 获取主网卡
+INTERFACE=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')
+[[ -z "$INTERFACE" ]] && echo -e "${RED}错误：无法自动识别网卡，请检查路由/网络。${PLAIN}" && exit 1
+
+# IFB 设备名（用于入方向整形）
+IFB_DEV="ifb0"
+
+# QUANTUM 设置
+USER_QUANTUM=15000
+ROOT_QUANTUM=200000
+
+# 默认类（避开 1:10 的十六进制坑）
+DEFAULT_MINOR_HEX="fffe"
+DEFAULT_CLASSID="1:${DEFAULT_MINOR_HEX}"
+DEFAULT_HANDLE="fffe:"
+
+# 端口 class minor 偏移，避免撞保留值
+PORT_CLASS_OFFSET=4096  # 0x1000
+
+# 根速率（默认“不限”，给个很大值）
+ROOT_RATE="10000mbit"
+
+# burst（HTB 的 burst 这里用较大一点更平滑）
+DEFAULT_BURST="1m"
+
+# ----------------- 工具函数 -----------------
+
+is_number() { [[ "$1" =~ ^[0-9]+$ ]]; }
+
+port_to_hex_minor() {
+  local port="$1"
+  local minor=$((port + PORT_CLASS_OFFSET))
+  printf '%x' "$minor"
+}
+
+# 确保 ifb0 存在并 up
+ensure_ifb() {
+  modprobe ifb >/dev/null 2>&1 || true
+
+  if ! ip link show "$IFB_DEV" >/dev/null 2>&1; then
+    ip link add "$IFB_DEV" type ifb >/dev/null 2>&1 || {
+      echo -e "${RED}错误：创建 $IFB_DEV 失败（内核/权限/模块问题）。${PLAIN}"
+      return 1
+    }
+  fi
+
+  ip link set dev "$IFB_DEV" up >/dev/null 2>&1 || true
+  return 0
+}
+
+# 建立：物理网卡 ingress -> redirect 到 ifb0（实现入方向可整形）
+ensure_ingress_redirect() {
+  ensure_ifb || return 1
+
+  # 物理网卡 ingress qdisc
+  if ! tc qdisc show dev "$INTERFACE" 2>/dev/null | grep -q "ffff:"; then
+    tc qdisc add dev "$INTERFACE" handle ffff: ingress 2>/dev/null || true
+  fi
+
+  # 是否已有 redirect 规则
+  if tc filter show dev "$INTERFACE" parent ffff: 2>/dev/null | grep -q "mirred.*redirect.*$IFB_DEV"; then
+    return 0
+  fi
+
+  # 先尝试清理可能的旧 redirect
+  tc filter del dev "$INTERFACE" parent ffff: protocol ip prio 1 >/dev/null 2>&1 || true
+
+  # 添加 redirect：把所有 ingress 流量转到 ifb0（在 ifb0 上做 HTB shaping）
+  tc filter add dev "$INTERFACE" parent ffff: protocol ip prio 1 u32 \
+    match u32 0 0 action mirred egress redirect dev "$IFB_DEV" 2>/dev/null || {
+      echo -e "${RED}错误：设置 ingress redirect 失败。${PLAIN}"
+      return 1
+    }
+
+  return 0
+}
+
+# 初始化 HTB 树（通用：某设备的 root htb + 根类 + 默认类 + fq_codel）
+init_htb_tree() {
+  local dev="$1"
+
+  # root htb
+  if ! tc qdisc show dev "$dev" 2>/dev/null | grep -q "htb 1:"; then
+    tc qdisc add dev "$dev" root handle 1: htb default "$DEFAULT_MINOR_HEX" r2q 10 2>/dev/null || true
+  else
+    tc qdisc replace dev "$dev" root handle 1: htb default "$DEFAULT_MINOR_HEX" r2q 10 2>/dev/null || true
+  fi
+
+  # 根类 1:1
+  if ! tc class show dev "$dev" 2>/dev/null | grep -q "1:1 "; then
+    tc class add dev "$dev" parent 1: classid 1:1 htb rate "$ROOT_RATE" quantum "$ROOT_QUANTUM" 2>/dev/null || true
+  else
+    tc class replace dev "$dev" parent 1: classid 1:1 htb rate "$ROOT_RATE" quantum "$ROOT_QUANTUM" 2>/dev/null || true
+  fi
+
+  # 默认类 1:fffe（未命中流量走这里）
+  if ! tc class show dev "$dev" 2>/dev/null | grep -q "${DEFAULT_CLASSID} "; then
+    tc class add dev "$dev" parent 1:1 classid "$DEFAULT_CLASSID" htb rate "$ROOT_RATE" quantum "$ROOT_QUANTUM" 2>/dev/null || true
+  else
+    tc class replace dev "$dev" parent 1:1 classid "$DEFAULT_CLASSID" htb rate "$ROOT_RATE" quantum "$ROOT_QUANTUM" 2>/dev/null || true
+  fi
+
+  # 默认类挂 fq_codel（非常关键）
+  tc qdisc replace dev "$dev" parent "$DEFAULT_CLASSID" handle "$DEFAULT_HANDLE" fq_codel 2>/dev/null || true
+}
+
+# 初始化出方向（物理网卡 egress）+ 入方向（ifb0 egress）的整形树
+init_all_trees() {
+  init_htb_tree "$INTERFACE"          # 下行/outbound
+  ensure_ingress_redirect || return 1 # 上行/inbound redirect
+  init_htb_tree "$IFB_DEV"            # 上行/inbound（在 ifb0 上整形）
+  return 0
+}
+
+# ----------------- UI：端口选择 -----------------
+
+SELECTED_PORT=""
+
+function select_active_port() {
+  echo -e "${YELLOW}[List] 正在扫描可操作端口...${PLAIN}"
+  echo -e "------------------------------------------------"
+  printf "%-5s %-10s %-12s %-20s\n" "编号" "协议" "端口" "进程"
+  echo -e "------------------------------------------------"
+
+  declare -a port_list
+  index=1
+
+  while read -r proto address process; do
+    port=$(echo "$address" | awk -F':' '{print $NF}')
+    [[ -z "$port" ]] && continue
+    is_number "$port" || continue
+
+    proc_name=$(echo "$process" | awk -F'"' '{print $2}')
+    [[ -z "$proc_name" ]] && proc_name="-"
+
+    port_list[$index]=$port
+    printf "${GREEN}[%d]${PLAIN}   %-10s %-12s %-20s\n" "$index" "$proto" "$port" "$proc_name"
+    ((index++))
+  done < <(ss -tulpn 2>/dev/null | grep LISTEN | awk '{print $1, $5, $7}')
+
+  echo -e "------------------------------------------------"
+  echo -e "${GREEN}[m]${PLAIN}   手动输入端口号 (Manual Input)"
+  echo -e "------------------------------------------------"
+
+  read -p "请选择端口编号 (输入 m 手动填写): " select_idx
+
+  if [[ "$select_idx" == "m" ]]; then
+    read -p "请输入端口号: " input_port
+    if ! is_number "$input_port"; then
+      echo -e "${RED}错误：端口必须是数字！${PLAIN}"
+      SELECTED_PORT=""
+      return
     fi
-fi
-echo ">>> 自启检查完毕。"
+    SELECTED_PORT=$input_port
+  elif [[ -n "${port_list[$select_idx]}" ]]; then
+    SELECTED_PORT="${port_list[$select_idx]}"
+    echo -e "${BLUE}你选择了端口: $SELECTED_PORT${PLAIN}"
+  else
+    echo -e "${RED}无效选择！${PLAIN}"
+    SELECTED_PORT=""
+  fi
+}
 
-# 6. 验证：直接拉取文件测试 (避开 Speedtest 节点抽风问题)
-echo -e "\n[5/5] 最终验证：直接从 Cloudflare 拉取文件测速..."
-echo "正在测试下行速度 (目标: 恢复正常带宽)..."
-# 使用 curl 打印速度，超时时间 10秒
-curl -o /dev/null http://speed.cloudflare.com/__down?bytes=50000000 -w "\n下载速度: %{speed_download} byte/s\n" --connect-timeout 5 --max-time 15
+# ----------------- 功能 1：端口状态 -----------------
 
-echo -e "\n=========================================="
-echo " 如果上面的下载速度显示正常 (如几MB/s或几十MB/s)，"
-echo " 说明你的 VPS 网络已完全恢复！"
-echo " 如果依然只有几KB，说明大概率是被 VPS 商家限速了。"
-echo "=========================================="
+function check_port_status() {
+  clear
+  echo -e "${YELLOW}[Scanning] 活跃端口深度扫描...${PLAIN}"
+  echo -e "----------------------------------------------------------------------"
+  printf "%-10s %-12s %-15s %-15s %-20s\n" "协议" "端口" "状态" "活跃连接数" "进程名"
+  echo -e "----------------------------------------------------------------------"
+
+  ss -tulpn 2>/dev/null | grep LISTEN | awk '{print $1, $5, $7}' | while read -r proto address process; do
+    port=$(echo "$address" | awk -F':' '{print $NF}')
+    is_number "$port" || continue
+
+    if [[ "$proto" == "tcp" ]]; then
+      ptag="TCP"; pcolor="${GREEN}"
+      conn=$(ss -tn state established 2>/dev/null | awk '{print $4}' | grep -w ":$port" | wc -l)
+    else
+      ptag="UDP"; pcolor="${BLUE}"
+      conn=$(ss -un 2>/dev/null | awk '{print $4}' | grep -w ":$port" | wc -l)
+    fi
+
+    proc=$(echo "$process" | awk -F'"' '{print $2}')
+    [[ -z "$proc" ]] && proc="-"
+
+    if [[ "$conn" -gt 0 ]]; then
+      conn_str="${conn} (Active)"; conn_color="${RED}"
+    else
+      conn_str="0"; conn_color="${PLAIN}"
+    fi
+
+    printf "${pcolor}%-10s${PLAIN} %-12s %-15s ${conn_color}%-15s${PLAIN} %-20s\n" "$ptag" "$port" "Listening" "$conn_str" "$proc"
+  done
+
+  echo -e "----------------------------------------------------------------------"
+}
+
+# ----------------- 功能 2：端口限速（出入都用 shaping） -----------------
+
+function apply_port_limit() {
+  echo -e "\n${BLUE}--- 配置端口限速（V8.2 IFB Shaping）---${PLAIN}"
+
+  select_active_port
+  [[ -z "$SELECTED_PORT" ]] && return
+  PORT=$SELECTED_PORT
+
+  echo -e "\n请选择限制方向："
+  echo -e "1. ${GREEN}下行${PLAIN} (Outbound / 用户下载：物理网卡 egress)"
+  echo -e "2. ${GREEN}上行${PLAIN} (Inbound / 用户上传：IFB 入方向整形)"
+  echo -e "3. ${YELLOW}双向${PLAIN} (同时限制)"
+  read -p "请输入选项 [1-3]: " dir_choice
+
+  case $dir_choice in
+    1) direction="out" ;;
+    2) direction="in" ;;
+    3) direction="bi" ;;
+    *) echo -e "${RED}无效选项：默认双向${PLAIN}"; direction="bi" ;;
+  esac
+
+  read -p "请输入速率限制 (Mbps): " RATE_MBPS
+  if ! is_number "$RATE_MBPS" || [[ "$RATE_MBPS" -le 0 ]]; then
+    echo -e "${RED}错误：速率必须为正整数 Mbps${PLAIN}"
+    return
+  fi
+
+  RATE_KBIT=$((RATE_MBPS * 1000))
+  BURST="$DEFAULT_BURST"
+
+  HEX_ID=$(port_to_hex_minor "$PORT")
+  CLASSID="1:${HEX_ID}"
+  HANDLE="${HEX_ID}0:"
+
+  init_all_trees || { echo -e "${RED}初始化失败：IFB/redirect/HTB 未就绪。${PLAIN}"; return; }
+
+  echo -e "${YELLOW}[Config] Port: $PORT  Rate: ${RATE_MBPS}Mbps  Class: $CLASSID${PLAIN}"
+
+  # -------- 下行（物理网卡 egress）：match sport ----------
+  if [[ "$direction" == "out" || "$direction" == "bi" ]]; then
+    tc filter del dev "$INTERFACE" parent 1:0 prio "$PORT" >/dev/null 2>&1 || true
+    tc qdisc  del dev "$INTERFACE" parent "$CLASSID" >/dev/null 2>&1 || true
+    tc class  del dev "$INTERFACE" parent 1:1 classid "$CLASSID" >/dev/null 2>&1 || true
+
+    tc class add dev "$INTERFACE" parent 1:1 classid "$CLASSID" htb \
+      rate "${RATE_KBIT}kbit" ceil "${RATE_KBIT}kbit" burst "$BURST" quantum "$USER_QUANTUM" 2>/dev/null || \
+    tc class replace dev "$INTERFACE" parent 1:1 classid "$CLASSID" htb \
+      rate "${RATE_KBIT}kbit" ceil "${RATE_KBIT}kbit" burst "$BURST" quantum "$USER_QUANTUM" 2>/dev/null
+
+    tc qdisc replace dev "$INTERFACE" parent "$CLASSID" handle "$HANDLE" fq_codel 2>/dev/null || true
+
+    tc filter add dev "$INTERFACE" protocol ip parent 1:0 prio "$PORT" u32 \
+      match ip sport "$PORT" 0xffff flowid "$CLASSID" 2>/dev/null || true
+  fi
+
+  # -------- 上行（IFB egress = 物理 ingress）：match dport ----------
+  if [[ "$direction" == "in" || "$direction" == "bi" ]]; then
+    # 注意：在 ifb0 上做整形，所以删除/添加都在 ifb0
+    tc filter del dev "$IFB_DEV" parent 1:0 prio "$PORT" >/dev/null 2>&1 || true
+    tc qdisc  del dev "$IFB_DEV" parent "$CLASSID" >/dev/null 2>&1 || true
+    tc class  del dev "$IFB_DEV" parent 1:1 classid "$CLASSID" >/dev/null 2>&1 || true
+
+    tc class add dev "$IFB_DEV" parent 1:1 classid "$CLASSID" htb \
+      rate "${RATE_KBIT}kbit" ceil "${RATE_KBIT}kbit" burst "$BURST" quantum "$USER_QUANTUM" 2>/dev/null || \
+    tc class replace dev "$IFB_DEV" parent 1:1 classid "$CLASSID" htb \
+      rate "${RATE_KBIT}kbit" ceil "${RATE_KBIT}kbit" burst "$BURST" quantum "$USER_QUANTUM" 2>/dev/null
+
+    tc qdisc replace dev "$IFB_DEV" parent "$CLASSID" handle "$HANDLE" fq_codel 2>/dev/null || true
+
+    tc filter add dev "$IFB_DEV" protocol ip parent 1:0 prio "$PORT" u32 \
+      match ip dport "$PORT" 0xffff flowid "$CLASSID" 2>/dev/null || true
+  fi
+
+  echo -e "${GREEN}[Success] 端口 $PORT 限速已生效（IFB 入方向整形，不靠丢包）。${PLAIN}"
+}
+
+# ----------------- 功能 3：全局限速（出入都 shaping） -----------------
+
+function apply_global_limit() {
+  echo -e "\n${BLUE}--- 全局限速 (整机，出入都 shaping) ---${PLAIN}"
+  read -p "请输入总速率 (Mbps): " RATE_MBPS
+  if ! is_number "$RATE_MBPS" || [[ "$RATE_MBPS" -le 0 ]]; then
+    echo -e "${RED}错误：速率必须为正整数 Mbps${PLAIN}"
+    return
+  fi
+
+  RATE_KBIT=$((RATE_MBPS * 1000))
+  BURST="$DEFAULT_BURST"
+
+  # 确保 ifb + redirect + 两边树都在
+  init_all_trees || { echo -e "${RED}初始化失败：IFB/redirect/HTB 未就绪。${PLAIN}"; return; }
+
+  # 物理网卡默认类限速（out）
+  tc class replace dev "$INTERFACE" parent 1:1 classid "$DEFAULT_CLASSID" htb \
+    rate "${RATE_KBIT}kbit" ceil "${RATE_KBIT}kbit" burst "$BURST" quantum "$USER_QUANTUM" 2>/dev/null || true
+  tc qdisc replace dev "$INTERFACE" parent "$DEFAULT_CLASSID" handle "$DEFAULT_HANDLE" fq_codel 2>/dev/null || true
+
+  # IFB 默认类限速（in）
+  tc class replace dev "$IFB_DEV" parent 1:1 classid "$DEFAULT_CLASSID" htb \
+    rate "${RATE_KBIT}kbit" ceil "${RATE_KBIT}kbit" burst "$BURST" quantum "$USER_QUANTUM" 2>/dev/null || true
+  tc qdisc replace dev "$IFB_DEV" parent "$DEFAULT_CLASSID" handle "$DEFAULT_HANDLE" fq_codel 2>/dev/null || true
+
+  echo -e "${GREEN}[Success] 全局限速已生效（出入均为 shaping，不会“像断网”）。${PLAIN}"
+}
+
+# ----------------- 功能 4：解除限制 -----------------
+
+function remove_limit() {
+  echo -e "\n1. 解除指定端口 (可区分方向)"
+  echo -e "2. 重置所有限制 (网卡级 + IFB + redirect 清理)"
+  read -p "选择: " sel
+
+  if [[ "$sel" == "1" ]]; then
+    select_active_port
+    [[ -z "$SELECTED_PORT" ]] && return
+    PORT=$SELECTED_PORT
+
+    HEX_ID=$(port_to_hex_minor "$PORT")
+    CLASSID="1:${HEX_ID}"
+
+    echo -e "\n请选择要解除的方向："
+    echo -e "1. 仅解除 ${GREEN}下行限制${PLAIN} (Outbound, 物理网卡)"
+    echo -e "2. 仅解除 ${GREEN}上行限制${PLAIN} (Inbound, IFB)"
+    echo -e "3. 解除 ${RED}双向限制${PLAIN} (Both)"
+    read -p "输入选项 [1-3]: " rm_choice
+
+    # 确保树存在（否则删除可能报错但无所谓）
+    init_all_trees >/dev/null 2>&1 || true
+
+    case $rm_choice in
+      1)
+        tc filter del dev "$INTERFACE" parent 1:0 prio "$PORT" >/dev/null 2>&1 || true
+        tc qdisc  del dev "$INTERFACE" parent "$CLASSID" >/dev/null 2>&1 || true
+        tc class  del dev "$INTERFACE" parent 1:1 classid "$CLASSID" >/dev/null 2>&1 || true
+        echo -e "${GREEN}端口 $PORT [下行] 限制已移除。${PLAIN}"
+        ;;
+      2)
+        tc filter del dev "$IFB_DEV" parent 1:0 prio "$PORT" >/dev/null 2>&1 || true
+        tc qdisc  del dev "$IFB_DEV" parent "$CLASSID" >/dev/null 2>&1 || true
+        tc class  del dev "$IFB_DEV" parent 1:1 classid "$CLASSID" >/dev/null 2>&1 || true
+        echo -e "${GREEN}端口 $PORT [上行] 限制已移除。${PLAIN}"
+        ;;
+      *)
+        tc filter del dev "$INTERFACE" parent 1:0 prio "$PORT" >/dev/null 2>&1 || true
+        tc qdisc  del dev "$INTERFACE" parent "$CLASSID" >/dev/null 2>&1 || true
+        tc class  del dev "$INTERFACE" parent 1:1 classid "$CLASSID" >/dev/null 2>&1 || true
+
+        tc filter del dev "$IFB_DEV" parent 1:0 prio "$PORT" >/dev/null 2>&1 || true
+        tc qdisc  del dev "$IFB_DEV" parent "$CLASSID" >/dev/null 2>&1 || true
+        tc class  del dev "$IFB_DEV" parent 1:1 classid "$CLASSID" >/dev/null 2>&1 || true
+        echo -e "${GREEN}端口 $PORT [双向] 限制已全部移除。${PLAIN}"
+        ;;
+    esac
+
+    # 保底：确保默认类叶子队列还在
+    init_all_trees >/dev/null 2>&1 || true
+
+  elif [[ "$sel" == "2" ]]; then
+    # 1) 清理物理网卡 egress shaping
+    tc qdisc del dev "$INTERFACE" root >/dev/null 2>&1 || true
+
+    # 2) 清理 ingress redirect
+    tc filter del dev "$INTERFACE" parent ffff: protocol ip prio 1 >/dev/null 2>&1 || true
+    tc qdisc del dev "$INTERFACE" ingress >/dev/null 2>&1 || true
+
+    # 3) 清理 ifb shaping
+    tc qdisc del dev "$IFB_DEV" root >/dev/null 2>&1 || true
+
+    # 4) 删除 ifb 设备（干净）
+    ip link set dev "$IFB_DEV" down >/dev/null 2>&1 || true
+    ip link del "$IFB_DEV" >/dev/null 2>&1 || true
+
+    echo -e "${GREEN}已重置：物理网卡 + IFB + redirect 全部清理完成。${PLAIN}"
+  fi
+}
+
+# ----------------- 功能 5：测速 -----------------
+
+function run_pro_speedtest() {
+  echo -e "${YELLOW}[Testing] Speedtest...${PLAIN}"
+  if [ ! -f "./speedtest" ]; then
+    ARCH=$(uname -m)
+    [[ "$ARCH" == "x86_64" ]] && URL="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz"
+    [[ "$ARCH" == "aarch64" ]] && URL="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz"
+    if [[ -z "$URL" ]]; then
+      echo -e "${RED}不支持的架构: $ARCH${PLAIN}"
+      return
+    fi
+    curl -sL "$URL" | tar xz speedtest && chmod +x speedtest
+  fi
+  ./speedtest --accept-license --accept-gdpr
+}
+
+# ----------------- 主菜单 -----------------
+
+function show_menu() {
+  clear
+  echo -e "=================================================="
+  echo -e "       VPS 流量控制台 V8.2 (IFB Shaping)"
+  echo -e "       物理网卡: ${GREEN}${INTERFACE}${PLAIN}"
+  echo -e "       IFB 设备: ${GREEN}${IFB_DEV}${PLAIN}  (用于入方向整形)"
+  echo -e "       默认类:   ${GREEN}${DEFAULT_CLASSID}${PLAIN}  (避冲突 + fq_codel)"
+  echo -e "=================================================="
+  echo -e "1. 查看活跃端口 (状态监控)"
+  echo -e "--------------------------------------------------"
+  echo -e "2. 设置 ${YELLOW}端口限速${PLAIN} (出入均 shaping)"
+  echo -e "3. 设置 ${RED}全局限速${PLAIN} (出入均 shaping)"
+  echo -e "--------------------------------------------------"
+  echo -e "4. 解除限制 / 重置 (含 IFB 清理)"
+  echo -e "5. 运行测速 (Speedtest)"
+  echo -e "0. 退出"
+  echo -e "=================================================="
+  read -p "选择: " choice
+
+  case $choice in
+    1) check_port_status; read -p "回车返回..." ;;
+    2) apply_port_limit; read -p "回车返回..." ;;
+    3) apply_global_limit; read -p "回车返回..." ;;
+    4) remove_limit; read -p "回车返回..." ;;
+    5) run_pro_speedtest; read -p "回车返回..." ;;
+    0) exit 0 ;;
+    *) show_menu ;;
+  esac
+  show_menu
+}
+
+show_menu
