@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==================================================
-# VPS 流量控制台 V10.18 (All-in-One Nodes + 2-Col Layout)
+# VPS 流量控制台 V10.21 (System Update Added)
 #
 # 功能全集：
 # 1) 监听端口 (列表)
@@ -10,14 +10,12 @@
 # 5) 查看限速清单
 # 6) 移除 Xray 限速
 # 7) 全部重置
-# 8) [升级] Speedtest (国内+广电+国际，双列显示)
+# 8) Speedtest (国内+广电+国际，双列显示)
 # 9) 实时流量监控
 # 10) 彻底卸载
 #
-# 修改记录 V10.18:
-# - [恢复] 恢复国内三大运营商节点
-# - [新增] 增加中国广电 (Broadnet) 节点
-# - [优化] 节点列表改为双列显示，防止刷屏
+# 修改记录 V10.21:
+# - [新增] 启动时自动检测系统并更新软件源 (实时显示过程)
 # ==================================================
 
 set -u
@@ -29,9 +27,25 @@ BLUE='\033[36m'
 CYAN='\033[96m'
 PLAIN='\033[0m'
 
+# 1. 权限检查
 [[ ${EUID:-999} -ne 0 ]] && echo -e "${RED}错误：请使用 root 用户运行！${PLAIN}" && exit 1
 
-# 检查基础命令
+# 2. [新增] 系统检测与更新 (实时显示)
+echo -e "${YELLOW}正在检测系统类型并更新软件源...${PLAIN}"
+if [ -f /etc/debian_version ]; then
+    echo -e "${BLUE}检测到 Debian/Ubuntu 系统，执行 apt-get update...${PLAIN}"
+    # 不使用 -q 或 >/dev/null，保留完整输出
+    apt-get update
+elif [ -f /etc/redhat-release ]; then
+    echo -e "${BLUE}检测到 CentOS/RedHat 系统，执行 yum makecache...${PLAIN}"
+    # 不使用 -q 或 >/dev/null，保留完整输出
+    yum makecache
+else
+    echo -e "${RED}未识别的操作系统，跳过自动更新。${PLAIN}"
+fi
+echo -e "${GREEN}系统软件源更新完成！${PLAIN}\n"
+
+# 3. 依赖检查
 for cmd in ip tc ss awk sed grep cut tr uname date mkdir mv rm modprobe ps id curl head wc mktemp cat tar; do
   command -v "$cmd" >/dev/null 2>&1 || { echo -e "${RED}缺少命令: $cmd${PLAIN}"; exit 1; }
 done
@@ -302,7 +316,10 @@ apply_xray_in_limit(){
 menu_set_xray_limits(){
   echo -e "\n${BLUE}--- 限制 Xray 速度 ---${PLAIN}"
   echo -e "1) 仅限制 出站\n2) 仅限制 入站\n3) 限制 入站+出站"
+  echo -e "0) 返回主菜单"
   read -p "选择: " sel
+  if [[ "$sel" == "0" ]]; then return; fi
+
   read -p "输入速率(Mbps): " mbps
   [[ ! "$mbps" =~ ^[0-9]+$ ]] && echo -e "${RED}无效数字${PLAIN}" && return
   init_all || { echo -e "${RED}Init failed${PLAIN}"; return; }
@@ -397,13 +414,16 @@ menu_port_limit(){
   fi
 
   echo -e "----------------------------------------------------------------"
+  echo -e "${GREEN}[0]${PLAIN}    返回主菜单"
   echo -e "${GREEN}[m]${PLAIN}    手动输入端口号"
   echo -e "----------------------------------------------------------------"
 
-  read -p "请输入序号 或 m : " sel
+  read -p "请输入序号/m/0 : " sel
   local target_port=""
 
-  if [[ "$sel" == "m" ]]; then
+  if [[ "$sel" == "0" ]]; then
+      return
+  elif [[ "$sel" == "m" ]]; then
       read -p "请输入端口号: " input_p
       target_port="$input_p"
   elif [[ "$sel" =~ ^[0-9]+$ ]] && [[ "$sel" -le "$idx" ]] && [[ "$sel" -gt 0 ]]; then
@@ -430,7 +450,7 @@ menu_port_limit(){
   esac
 }
 
-# ----------------- 4) Port Limits (Remove) [ENHANCED] -----------------
+# ----------------- 4) Port Limits (Remove) -----------------
 remove_port_limit_exec(){
   local port="$1"
   local found=0
@@ -494,9 +514,12 @@ menu_remove_port_limit(){
   done < "$DB_FILE"
   echo -e "--------------------------------------------------------"
 
-  echo -e "${GREEN}[输入]${PLAIN} 请输入序号(移除该条目端口的所有限制) 或 直接输入端口号:"
+  echo -e "${GREEN}[0]${PLAIN}    返回主菜单"
+  echo -e "${GREEN}[输入]${PLAIN} 请输入序号 或 端口号:"
   read -p "选择: " input_val
   
+  if [[ "$input_val" == "0" ]]; then return; fi
+
   local target_port=""
   if [[ "$input_val" =~ ^[0-9]+$ ]] && [[ "$input_val" -le "$idx" ]] && [[ "$input_val" -gt 0 ]]; then
       target_port="${r_list_port[$input_val]}"
@@ -531,7 +554,10 @@ show_limits(){
 menu_remove_xray_limits(){
   echo -e "\n${BLUE}--- 移除 Xray 限速 ---${PLAIN}"
   echo -e "1) 移除 出站\n2) 移除 入站\n3) 全部移除"
+  echo -e "0) 返回主菜单"
   read -p "选择: " sel
+  if [[ "$sel" == "0" ]]; then return; fi
+
   init_all >/dev/null 2>&1 || true
   [[ "$sel" == "1" || "$sel" == "3" ]] && {
      tc filter del dev "$INTERFACE" parent 1:0 protocol all prio 10 >/dev/null 2>&1 || true
@@ -561,7 +587,7 @@ reset_all(){
   echo -e "${GREEN}已重置所有 TC/NFT 规则${PLAIN}"
 }
 
-# ----------------- 8) Speedtest (2-Col Layout) -----------------
+# ----------------- 8) Speedtest (All-in-One 24 Nodes) -----------------
 install_ookla_speedtest(){
   echo -e "${YELLOW}检测到未安装 speedtest，正在安装...${PLAIN}"
   local installed=0
@@ -591,32 +617,33 @@ install_ookla_speedtest(){
 run_ookla_speedtest(){
   if ! command -v speedtest >/dev/null 2>&1; then install_ookla_speedtest || { echo -e "${RED}安装失败${PLAIN}"; return; }; fi
   
-  echo -e "\n${BLUE}========== Speedtest by Ookla (Global Nodes) ==========${PLAIN}"
-  echo -e "${YELLOW}--- 中国国内 (China Domestic) ---${PLAIN}"
-  printf "%-36s | %-36s\n" "1) 3633 (电信|上海)" "2) 27594 (电信|南京)"
-  printf "%-36s | %-36s\n" "3) 27377 (电信|合肥)" "4) 24447 (联通|上海)"
-  printf "%-36s | %-36s\n" "5) 4870 (联通|长沙)" "6) 16803 (移动|上海)"
-  printf "%-36s | %-36s\n" "7) 25858 (移动|北京)" "8) 55299 (广电|南京)"
-  printf "%-36s\n" "9) 58529 (广电|北京)"
+  echo -e "\n${BLUE}========== Speedtest by Ookla (Global + Domestic) ==========${PLAIN}"
   
-  echo -e "\n${YELLOW}--- 亚洲邻国 (Asia Nearby) ---${PLAIN}"
-  printf "%-36s | %-36s\n" "10) 13538 (香港|STC)" "11) 1536 (香港|CSL)"
+  echo -e "${YELLOW}--- 中国国内 (China) ---${PLAIN}"
+  printf "%-36s | %-36s\n" " 1) 3633  (电信|上海)" " 2) 27594 (电信|南京)"
+  printf "%-36s | %-36s\n" " 3) 27377 (电信|合肥)" " 4) 24447 (联通|上海)"
+  printf "%-36s | %-36s\n" " 5) 4870  (联通|长沙)" " 6) 16803 (移动|上海)"
+  printf "%-36s | %-36s\n" " 7) 25858 (移动|北京)" " 8) 55299 (广电|南京)"
+  printf "%-36s\n" " 9) 58529 (广电|北京)"
+  
+  echo -e "\n${YELLOW}--- 亚洲 (Asia) ---${PLAIN}"
+  printf "%-36s | %-36s\n" "10) 13538 (香港|STC)" "11) 1536  (香港|CSL)"
   printf "%-36s | %-36s\n" "12) 18445 (台湾|中华电信)" "13) 21569 (日本|IPA)"
   printf "%-36s | %-36s\n" "14) 48463 (日本|Rakuten)" "15) 26685 (韩国|Kdatacenter)"
   printf "%-36s\n" "16) 13623 (新加坡|Singtel)"
   
-  echo -e "\n${YELLOW}--- 欧美/其他 (Global Others) ---${PLAIN}"
+  echo -e "\n${YELLOW}--- 欧美 (Euro/America) ---${PLAIN}"
   printf "%-36s | %-36s\n" "17) 17383 (美国|洛杉矶)" "18) 14236 (美国|圣何塞)"
-  printf "%-36s | %-36s\n" "19) 5029 (美国|纽约)" "20) 30537 (加拿大|Rogers)"
+  printf "%-36s | %-36s\n" "19) 5029  (美国|纽约)" "20) 30537 (加拿大|Rogers)"
   printf "%-36s | %-36s\n" "21) 35055 (英国|伦敦)" "22) 31120 (德国|法兰克福)"
-  printf "%-36s | %-36s\n" "23) 1688 (法国|Bouygues)" "24) 5252 (荷兰|KPN)"
-  printf "%-36s | %-36s\n" "25) 1907 (俄罗斯|MTS)" "26) 3234 (澳洲|Vodafone)"
-  printf "%-36s | %-36s\n" "27) 20562 (巴西|TIM)" "28) 25345 (印度|Jio)"
-  printf "%-36s\n" "29) 27357 (迪拜|du)"
+  printf "%-36s | %-36s\n" "23) 1688  (法国|Bouygues)" "24) 5252  (荷兰|KPN)"
   
   echo -e "------------------------------------------------------------------------"
-  read -p "请输入序号/ID (直接回车自动): " selection
+  echo -e "0) 返回主菜单"
+  read -p "请输入序号/ID (直接回车自动, 0返回): " selection
   
+  if [[ "$selection" == "0" ]]; then return; fi
+
   local sid=""
   case "$selection" in
     1) sid="3633" ;;
@@ -643,11 +670,6 @@ run_ookla_speedtest(){
     22) sid="31120" ;;
     23) sid="1688" ;;
     24) sid="5252" ;;
-    25) sid="1907" ;;
-    26) sid="3234" ;;
-    27) sid="20562" ;;
-    28) sid="25345" ;;
-    29) sid="27357" ;;
     "") sid="" ;;
     *) sid="$selection" ;; # 手动输入ID
   esac
@@ -721,7 +743,7 @@ do_uninstall(){
 show_menu(){
   clear
   echo -e "=================================================="
-  echo -e "   VPS 流量控制台 V10.18 (All-in-One Nodes)"
+  echo -e "   VPS 流量控制台 V10.21 (System Update Added)"
   echo -e "   网卡: ${GREEN}${INTERFACE}${PLAIN} | IFB: ${GREEN}${IFB_DEV}${PLAIN}"
   echo -e "   nftables: $(has_nft && echo -e "${GREEN}OK${PLAIN}" || echo -e "${YELLOW}缺失${PLAIN}")"
   echo -e "=================================================="
