@@ -1,22 +1,22 @@
 #!/bin/bash
 # ==================================================
-# VPS 流量控制台 V10.14 (Speedtest Nodes + Menu Fix)
+# VPS 流量控制台 V10.16 (Global Nodes Expanded)
 #
 # 功能全集：
 # 1) 监听端口 (列表)
 # 2) 限制 Xray 速度 (Docker/UID)
 # 3) 限制 特定端口 速率 (序号点选)
-# 4) 移除 特定端口 限速 (支持序号, 白色字体)
+# 4) 移除 特定端口 限速 (支持序号)
 # 5) 查看限速清单
 # 6) 移除 Xray 限速
 # 7) 全部重置
-# 8) [升级] Speedtest (内置20+热门节点列表)
+# 8) [升级] Speedtest (新增至19个全球核心节点)
 # 9) 实时流量监控
 # 10) 彻底卸载
 #
-# 修改记录 V10.14:
-# - [修复] 主菜单第4项字体颜色改为白色
-# - [新增] Speedtest 增加20个常用节点选择菜单
+# 修改记录 V10.16:
+# - [新增] Speedtest 增加台湾、韩国、英国、法国、荷兰、俄罗斯等地区节点
+# - [优化] 节点列表按大洲分类显示
 # ==================================================
 
 set -u
@@ -560,7 +560,7 @@ reset_all(){
   echo -e "${GREEN}已重置所有 TC/NFT 规则${PLAIN}"
 }
 
-# ----------------- 8) Speedtest (Enhanced) -----------------
+# ----------------- 8) Speedtest (Global 20+) -----------------
 install_ookla_speedtest(){
   echo -e "${YELLOW}检测到未安装 speedtest，正在安装...${PLAIN}"
   local installed=0
@@ -590,46 +590,56 @@ install_ookla_speedtest(){
 run_ookla_speedtest(){
   if ! command -v speedtest >/dev/null 2>&1; then install_ookla_speedtest || { echo -e "${RED}安装失败${PLAIN}"; return; }; fi
   
-  echo -e "\n${BLUE}========== Speedtest by Ookla ==========${PLAIN}"
-  echo -e "${YELLOW}热门节点推荐 (输入序号或ID):${PLAIN}"
-  echo -e "----------------------------------------"
-  echo -e "1)  3633    (中国电信 | 上海)"
-  echo -e "2)  27594   (中国电信 | 南京)"
-  echo -e "3)  27377   (中国电信 | 合肥)"
-  echo -e "4)  24447   (中国联通 | 上海)"
-  echo -e "5)  4870    (中国联通 | 长沙)"
-  echo -e "6)  16803   (中国移动 | 上海)"
-  echo -e "7)  25858   (中国移动 | 北京)"
-  echo -e "----------------------------------------"
-  echo -e "8)  13538   (香港 | STC)"
-  echo -e "9)  1536    (香港 | CSL)"
-  echo -e "10) 21569   (日本 | Tokyo IPA)"
-  echo -e "11) 48463   (日本 | Rakuten)"
-  echo -e "12) 13623   (新加坡 | Singtel)"
-  echo -e "13) 17383   (美国 | Los Angeles)"
-  echo -e "14) 14236   (美国 | San Jose)"
-  echo -e "15) 31120   (德国 | Frankfurt)"
-  echo -e "----------------------------------------"
+  echo -e "\n${BLUE}========== Speedtest by Ookla (Global Nodes) ==========${PLAIN}"
+  echo -e "${YELLOW}--- 亚洲 (Asia) ---${PLAIN}"
+  echo -e " 1) 13538   香港 (Hong Kong | STC)"
+  echo -e " 2) 1536    香港 (Hong Kong | CSL)"
+  echo -e " 3) 15693   台湾 (Taiwan | Chief)"
+  echo -e " 4) 21569   日本 (Tokyo | IPA)"
+  echo -e " 5) 48463   日本 (Rakuten Mobile)"
+  echo -e " 6) 26685   韩国 (Seoul | Kdatacenter)"
+  echo -e " 7) 13623   新加坡 (Singapore | Singtel)"
   
+  echo -e "${YELLOW}--- 美洲 (Americas) ---${PLAIN}"
+  echo -e " 8) 17383   美国 (Los Angeles | AT&T)"
+  echo -e " 9) 14236   美国 (San Jose | Dish)"
+  echo -e "10) 5029    美国 (New York | AT&T)"
+  echo -e "11) 17625   加拿大 (Toronto | Bell)"
+  echo -e "12) 25968   巴西 (Sao Paulo | Claro)"
+  
+  echo -e "${YELLOW}--- 欧洲 (Europe) ---${PLAIN}"
+  echo -e "13) 35055   英国 (London | Community Fibre)"
+  echo -e "14) 31120   德国 (Frankfurt | 23Media)"
+  echo -e "15) 5559    法国 (Paris | Orange)"
+  echo -e "16) 5252    荷兰 (Amsterdam | KPN)"
+  echo -e "17) 2361    俄罗斯 (Moscow | Rostelecom)"
+  
+  echo -e "${YELLOW}--- 大洋洲 (Oceania) ---${PLAIN}"
+  echo -e "18) 2627    澳大利亚 (Sydney | Telstra)"
+  
+  echo -e "----------------------------------------"
   read -p "请输入序号/ID (直接回车自动): " selection
   
   local sid=""
   case "$selection" in
-    1) sid="3633" ;;
-    2) sid="27594" ;;
-    3) sid="27377" ;;
-    4) sid="24447" ;;
-    5) sid="4870" ;;
-    6) sid="16803" ;;
-    7) sid="25858" ;;
-    8) sid="13538" ;;
-    9) sid="1536" ;;
-    10) sid="21569" ;;
-    11) sid="48463" ;;
-    12) sid="13623" ;;
-    13) sid="17383" ;;
-    14) sid="14236" ;;
-    15) sid="31120" ;;
+    1) sid="13538" ;;
+    2) sid="1536" ;;
+    3) sid="15693" ;;
+    4) sid="21569" ;;
+    5) sid="48463" ;;
+    6) sid="26685" ;;
+    7) sid="13623" ;;
+    8) sid="17383" ;;
+    9) sid="14236" ;;
+    10) sid="5029" ;;
+    11) sid="17625" ;;
+    12) sid="25968" ;;
+    13) sid="35055" ;;
+    14) sid="31120" ;;
+    15) sid="5559" ;;
+    16) sid="5252" ;;
+    17) sid="2361" ;;
+    18) sid="2627" ;;
     "") sid="" ;;
     *) sid="$selection" ;; # 手动输入ID
   esac
@@ -703,7 +713,7 @@ do_uninstall(){
 show_menu(){
   clear
   echo -e "=================================================="
-  echo -e "   VPS 流量控制台 V10.14 (Speedtest Nodes + Menu Fix)"
+  echo -e "   VPS 流量控制台 V10.16 (Global Nodes)"
   echo -e "   网卡: ${GREEN}${INTERFACE}${PLAIN} | IFB: ${GREEN}${IFB_DEV}${PLAIN}"
   echo -e "   nftables: $(has_nft && echo -e "${GREEN}OK${PLAIN}" || echo -e "${YELLOW}缺失${PLAIN}")"
   echo -e "=================================================="
@@ -715,7 +725,7 @@ show_menu(){
   echo -e "6. 移除 Xray 限速"
   echo -e "7. 全部重置 (Reset)"
   echo -e "--------------------------------------------------"
-  echo -e "8. Speedtest (含20+精选节点)"
+  echo -e "8. Speedtest (含19+全球节点)"
   echo -e "9. 实时流量监控 (Live Monitor)"
   echo -e "10. 彻底卸载与清理"
   echo -e "0. 退出"
