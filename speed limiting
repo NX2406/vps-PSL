@@ -1,22 +1,21 @@
 #!/bin/bash
 # ==================================================
-# VPS 流量控制台 V10.9 (Final Stable)
+# VPS 流量控制台 V10.11 (Port Selection Menu)
 #
 # 功能全集：
-# 1) 端口监听列表 (纯展示)
-# 2) Xray 限速 (支持 Docker/手动 UID 录入)
-# 3) 特定端口限速 (支持手动输入端口，上下行独立)
-# 4) 限速清单查看
-# 5) 移除 Xray 限速
-# 6) 全部重置
-# 7) Speedtest by Ookla (官方版，支持选节点)
-# 8) 实时流量监控 (修复乱码，原地刷新，回车返回)
-# 9) 彻底卸载
+# 1) 监听端口 (纯列表)
+# 2) 限制 Xray 速度 (Docker/UID)
+# 3) [优化] 限制 特定端口 (支持序号点选、自动排序、协议检测)
+# 4) 移除 特定端口 限速
+# 5) 查看限速清单
+# 6) 移除 Xray 限速
+# 7) 全部重置
+# 8) Speedtest by Ookla
+# 9) 实时流量监控
+# 10) 彻底卸载
 #
-# 修改记录 V10.9:
-# - [修复] 监控面板乱码问题 (ANSI 颜色代码解析)
-# - [优化] 监控面板改为 tput 原地刷新，杜绝滚屏
-# - [优化] 监控面板数值显示单位 (K/M/G 自动转换)
+# 修改记录 V10.11:
+# - [优化] 菜单3: 增加端口数字排序、协议识别、表格对齐、序号选择功能
 # ==================================================
 
 set -u
@@ -190,7 +189,7 @@ alloc_minor_for_port(){
   echo ""; return 1
 }
 
-# ----------------- 1) List Ports -----------------
+# ----------------- 1) List Ports (Display Only) -----------------
 list_active_ports(){
   echo -e "${YELLOW}[List] 扫描监听端口...${PLAIN}"
   echo -e "------------------------------------------------"
@@ -227,7 +226,6 @@ ensure_nft_mark_rule(){
   if ! nft list chain inet "$NFT_TABLE" "$NFT_CHAIN" >/dev/null 2>&1; then
     nft add chain inet "$NFT_TABLE" "$NFT_CHAIN" "{ type filter hook output priority mangle; policy accept; }" >/dev/null 2>&1 || true
   fi
-  # 检查是否已存在该UID规则
   if nft list chain inet "$NFT_TABLE" "$NFT_CHAIN" 2>/dev/null | grep -q "meta skuid .* meta mark set ${XRAY_MARK_DEC}"; then
     return 0
   fi
@@ -238,20 +236,11 @@ ensure_nft_mark_rule(){
 apply_xray_out_limit(){
   local mbps="$1"
   local uid; uid="$(detect_xray_uid_auto)"
-  
   if [[ -z "$uid" ]]; then
     echo -e "${YELLOW}警告：未能自动检测到 Xray 进程 UID。${PLAIN}"
-    echo -e "如果你正在使用 ${CYAN}Docker${PLAIN}，或者进程名不是 xray，请输入容器映射在宿主机的 UID。"
-    echo -e "(输入 0 或留空取消)"
-    read -p "手动输入 UID: " input_uid
-    if [[ -n "$input_uid" && "$input_uid" != "0" ]]; then
-      uid="$input_uid"
-    else
-      return 1
-    fi
+    read -p "手动输入 UID (0取消): " input_uid
+    if [[ -n "$input_uid" && "$input_uid" != "0" ]]; then uid="$input_uid"; else return 1; fi
   fi
-  
-  echo -e "${BLUE}正在对 UID: ${uid} 实施出站限速...${PLAIN}"
   ensure_nft_mark_rule "$uid" || return 1
 
   local rate_kbit=$((mbps * 1000))
@@ -281,11 +270,9 @@ get_xray_listen_ports(){
 apply_xray_in_limit(){
   local mbps="$1"
   local ports; ports="$(get_xray_listen_ports)"
-  [[ -z "$ports" ]] && { echo -e "${RED}[FAIL]${PLAIN} 未检测到 xray 监听端口 (无法应用入站限制)"; return 1; }
+  [[ -z "$ports" ]] && { echo -e "${RED}[FAIL]${PLAIN} 未检测到 xray 监听端口"; return 1; }
 
   local count; count="$(echo "$ports" | wc -l | tr -d ' ')"
-  echo -e "${YELLOW}检测到 ${count} 个端口:${PLAIN} $(echo "$ports" | tr '\n' ' ')"
-
   local rate_kbit=$((mbps * 1000))
   local handle_hex="0201"
 
@@ -312,9 +299,7 @@ apply_xray_in_limit(){
 
 menu_set_xray_limits(){
   echo -e "\n${BLUE}--- 限制 Xray 速度 ---${PLAIN}"
-  echo -e "1) 仅限制 出站 (支持 Docker/手动 UID)"
-  echo -e "2) 仅限制 入站 (基于监听端口)"
-  echo -e "3) 限制 入站+出站"
+  echo -e "1) 仅限制 出站\n2) 仅限制 入站\n3) 限制 入站+出站"
   read -p "选择: " sel
   read -p "输入速率(Mbps): " mbps
   [[ ! "$mbps" =~ ^[0-9]+$ ]] && echo -e "${RED}无效数字${PLAIN}" && return
@@ -326,7 +311,7 @@ menu_set_xray_limits(){
   esac
 }
 
-# ----------------- 3) Port Limits -----------------
+# ----------------- 3) Port Limits (Select Menu) -----------------
 apply_port_limit_one(){
   local port="$1" dir="$2" mbps="$3"
   local rate_kbit=$((mbps * 1000))
@@ -340,13 +325,10 @@ apply_port_limit_one(){
     tc filter del dev "$INTERFACE" parent 1:0 protocol ip prio "$port" >/dev/null 2>&1 || true
     tc filter del dev "$INTERFACE" parent 1:0 protocol ipv6 prio "$port" >/dev/null 2>&1 || true
     tc class del dev "$INTERFACE" parent 1:1 classid "$classid" >/dev/null 2>&1 || true
-
     run_or_fail "Class create" tc class add dev "$INTERFACE" parent 1:1 classid "$classid" htb rate "${rate_kbit}kbit" ceil "${rate_kbit}kbit" burst "$HTB_BURST" quantum "$USER_QUANTUM" || return 1
     attach_precise_leaf "$INTERFACE" "$classid" "$handle_hex" "$rate_kbit" || return 1
-
     run_or_fail "Filter IPv4" tc filter add dev "$INTERFACE" parent 1:0 protocol ip prio "$port" u32 match ip protocol 6 0xff match ip sport "$port" 0xffff flowid "$classid" || return 1
     tc filter add dev "$INTERFACE" parent 1:0 protocol ip prio "$port" u32 match ip protocol 17 0xff match ip sport "$port" 0xffff flowid "$classid" >/dev/null 2>&1 || true
-    
     if has_flower; then
       tc filter add dev "$INTERFACE" parent 1:0 protocol ipv6 prio "$port" flower ip_proto tcp src_port "$port" flowid "$classid" >/dev/null 2>&1 || true
       tc filter add dev "$INTERFACE" parent 1:0 protocol ipv6 prio "$port" flower ip_proto udp src_port "$port" flowid "$classid" >/dev/null 2>&1 || true
@@ -360,10 +342,8 @@ apply_port_limit_one(){
     tc filter del dev "$IFB_DEV" parent 1:0 protocol ip prio "$port" >/dev/null 2>&1 || true
     tc filter del dev "$IFB_DEV" parent 1:0 protocol ipv6 prio "$port" >/dev/null 2>&1 || true
     tc class del dev "$IFB_DEV" parent 1:1 classid "$classid" >/dev/null 2>&1 || true
-
     run_or_fail "Class create" tc class add dev "$IFB_DEV" parent 1:1 classid "$classid" htb rate "${rate_kbit}kbit" ceil "${rate_kbit}kbit" burst "$HTB_BURST" quantum "$USER_QUANTUM" || return 1
     attach_precise_leaf "$IFB_DEV" "$classid" "$handle_hex" "$rate_kbit" || return 1
-
     run_or_fail "Filter IPv4" tc filter add dev "$IFB_DEV" parent 1:0 protocol ip prio "$port" u32 match ip dport "$port" 0xffff flowid "$classid" || return 1
     if has_flower; then
       tc filter add dev "$IFB_DEV" parent 1:0 protocol ipv6 prio "$port" flower ip_proto tcp dst_port "$port" flowid "$classid" >/dev/null 2>&1 || true
@@ -376,25 +356,131 @@ apply_port_limit_one(){
 }
 
 menu_port_limit(){
-  echo -e "\n${BLUE}--- 特定端口限速 ---${PLAIN}"
-  list_active_ports
-  echo -e "${GREEN}[输入]${PLAIN} 请输入端口号:"
-  read -p "端口: " port
-  if ! is_number "$port" || [[ "$port" -le 0 || "$port" -gt 65535 ]]; then echo -e "${RED}端口无效${PLAIN}"; return; fi
+  echo -e "\n${BLUE}--- 特定端口限速 (支持序号点选) ---${PLAIN}"
+  
+  # 1. Gather data into arrays
+  declare -a p_port p_proto p_name
+  local idx=0
+  
+  local raw_data
+  # 解析 ss: 协议, 本地地址, 进程. 按端口数字排序
+  raw_data=$(ss -tunlp -H | awk '{
+      proto=$1; addr=$5; proc=$7
+      n=split(addr, a, ":"); port=a[n]
+      split(proc, p, "\""); name=p[2]
+      if (name == "") name="-"
+      print port, proto, name
+  }' | sort -k1,1n | uniq)
 
-  echo -e "1) 仅限制 出站/下行\n2) 仅限制 入站/上行\n3) 限制 入站+出站"
+  # Header
+  echo -e "----------------------------------------------------------------"
+  printf "${GREEN}%-6s %-8s %-10s %-20s${PLAIN}\n" "序号" "协议" "端口" "进程"
+  echo -e "----------------------------------------------------------------"
+
+  if [[ -z "$raw_data" ]]; then
+      echo -e "${YELLOW}未检测到活动端口${PLAIN}"
+  else
+      while read -r port proto name; do
+          idx=$((idx+1))
+          p_port[$idx]="$port"
+          p_proto[$idx]="$proto"
+          p_name[$idx]="$name"
+          
+          local color="$PLAIN"
+          [[ "$proto" == "tcp" ]] && color="$GREEN"
+          [[ "$proto" == "udp" ]] && color="$BLUE"
+          
+          printf "[%d]    ${color}%-8s${PLAIN} %-10s %-20s\n" "$idx" "${proto^^}" "$port" "$name"
+      done <<< "$raw_data"
+  fi
+
+  echo -e "----------------------------------------------------------------"
+  echo -e "${GREEN}[m]${PLAIN}    手动输入端口号"
+  echo -e "----------------------------------------------------------------"
+
+  read -p "请输入序号 或 m : " sel
+  local target_port=""
+
+  if [[ "$sel" == "m" ]]; then
+      read -p "请输入端口号: " input_p
+      target_port="$input_p"
+  elif [[ "$sel" =~ ^[0-9]+$ ]] && [[ "$sel" -le "$idx" ]] && [[ "$sel" -gt 0 ]]; then
+      target_port="${p_port[$sel]}"
+      echo -e "已选择: 端口 ${GREEN}${target_port}${PLAIN} (${p_name[$sel]})"
+  else
+      echo -e "${RED}输入无效${PLAIN}"
+      return
+  fi
+
+  if ! is_number "$target_port" || [[ "$target_port" -le 0 || "$target_port" -gt 65535 ]]; then 
+      echo -e "${RED}端口无效: $target_port${PLAIN}"; return; 
+  fi
+
+  echo -e "\n1) 仅限制 出站/下行\n2) 仅限制 入站/上行\n3) 限制 入站+出站"
   read -p "选择: " sel
   read -p "速率(Mbps): " mbps
   [[ ! "$mbps" =~ ^[0-9]+$ ]] && echo -e "${RED}无效数字${PLAIN}" && return
   init_all || { echo -e "${RED}Init failed${PLAIN}"; return; }
   case "$sel" in
-    1) apply_port_limit_one "$port" "out" "$mbps" ;;
-    2) apply_port_limit_one "$port" "in"  "$mbps" ;;
-    3) apply_port_limit_one "$port" "out" "$mbps" && apply_port_limit_one "$port" "in" "$mbps" ;;
+    1) apply_port_limit_one "$target_port" "out" "$mbps" ;;
+    2) apply_port_limit_one "$target_port" "in"  "$mbps" ;;
+    3) apply_port_limit_one "$target_port" "out" "$mbps" && apply_port_limit_one "$target_port" "in" "$mbps" ;;
   esac
 }
 
-# ----------------- 4) Show List -----------------
+# ----------------- 4) Port Limits (Remove) -----------------
+remove_port_limit_exec(){
+  local port="$1"
+  local found=0
+  if grep -qE "^PORT\|${port}\|" "$DB_FILE"; then found=1; fi
+  if [[ "$found" -eq 0 ]]; then echo -e "${YELLOW}未找到端口 ${port} 的限速记录${PLAIN}"; return; fi
+
+  # 1. Delete Filters
+  tc filter del dev "$INTERFACE" parent 1:0 protocol ip prio "$port" >/dev/null 2>&1 || true
+  tc filter del dev "$INTERFACE" parent 1:0 protocol ipv6 prio "$port" >/dev/null 2>&1 || true
+  tc filter del dev "$IFB_DEV" parent 1:0 protocol ip prio "$port" >/dev/null 2>&1 || true
+  tc filter del dev "$IFB_DEV" parent 1:0 protocol ipv6 prio "$port" >/dev/null 2>&1 || true
+
+  # 2. Delete Classes
+  while IFS='|' read -r type key dir mbps ts meta; do
+    if [[ "$type" == "PORT" && "$key" == "$port" ]]; then
+       local m; m="$(echo "$meta" | grep -o "minor=[0-9a-f]*" | cut -d= -f2)"
+       if [[ -n "$m" ]]; then
+         local classid="1:$m"
+         if [[ "$dir" == "out" ]]; then
+           tc qdisc del dev "$INTERFACE" parent "$classid" >/dev/null 2>&1 || true
+           tc class del dev "$INTERFACE" parent 1:1 classid "$classid" >/dev/null 2>&1 || true
+         elif [[ "$dir" == "in" ]]; then
+           tc qdisc del dev "$IFB_DEV" parent "$classid" >/dev/null 2>&1 || true
+           tc class del dev "$IFB_DEV" parent 1:1 classid "$classid" >/dev/null 2>&1 || true
+         fi
+       fi
+    fi
+  done < "$DB_FILE"
+
+  # 3. Clean DB
+  db_delete_prefix "PORT" "$port"
+  echo -e "${GREEN}已移除端口 ${port} 的所有限速规则${PLAIN}"
+}
+
+menu_remove_port_limit(){
+  echo -e "\n${BLUE}--- 移除 特定端口 限速 ---${PLAIN}"
+  if grep -q "PORT" "$DB_FILE"; then
+      echo -e "当前已限速端口:"
+      grep "PORT" "$DB_FILE" | cut -d| -f2 | sort -u | xargs echo -e "${GREEN}"
+      echo -e "${PLAIN}"
+  else
+      echo -e "${YELLOW}(当前无端口限速记录)${PLAIN}"
+      return
+  fi
+  echo -e "${GREEN}[输入]${PLAIN} 请输入要移除限速的端口号:"
+  read -p "端口: " port
+  if ! is_number "$port"; then echo -e "${RED}端口无效${PLAIN}"; return; fi
+  init_all >/dev/null 2>&1 || true
+  remove_port_limit_exec "$port"
+}
+
+# ----------------- 5) Show List -----------------
 show_limits(){
   clear
   echo -e "${BLUE}--- 当前限速清单 ---${PLAIN}"
@@ -408,7 +494,7 @@ show_limits(){
   echo -e "--------------------------------------------------------"
 }
 
-# ----------------- 5 & 6) Remove / Reset -----------------
+# ----------------- 6) Remove Xray Limits -----------------
 menu_remove_xray_limits(){
   echo -e "\n${BLUE}--- 移除 Xray 限速 ---${PLAIN}"
   echo -e "1) 移除 出站\n2) 移除 入站\n3) 全部移除"
@@ -430,6 +516,7 @@ menu_remove_xray_limits(){
   }
 }
 
+# ----------------- 7) Reset All -----------------
 reset_all(){
   tc qdisc del dev "$INTERFACE" root >/dev/null 2>&1 || true
   tc qdisc del dev "$INTERFACE" ingress >/dev/null 2>&1 || true
@@ -441,11 +528,10 @@ reset_all(){
   echo -e "${GREEN}已重置所有 TC/NFT 规则${PLAIN}"
 }
 
-# ----------------- 7) Speedtest Ookla (Advanced) -----------------
+# ----------------- 8) Speedtest -----------------
 install_ookla_speedtest(){
   echo -e "${YELLOW}检测到未安装 speedtest，正在安装...${PLAIN}"
   local installed=0
-  
   if [ -f /etc/debian_version ]; then
     curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash >/dev/null 2>&1
     apt-get update >/dev/null 2>&1 && apt-get install -y speedtest >/dev/null 2>&1 && installed=1
@@ -453,81 +539,52 @@ install_ookla_speedtest(){
     curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.rpm.sh | bash >/dev/null 2>&1
     yum install -y speedtest >/dev/null 2>&1 && installed=1
   fi
-
   if [[ "$installed" -eq 0 ]]; then
-    echo -e "${YELLOW}源安装失败，尝试下载二进制包...${PLAIN}"
     local arch; arch=$(uname -m)
     local url=""
     [[ "$arch" == "x86_64" ]] && url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz"
     [[ "$arch" == "aarch64" ]] && url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz"
-    
     if [[ -n "$url" ]]; then
        local tmpdir; tmpdir=$(mktemp -d)
        curl -L -o "$tmpdir/speedtest.tgz" "$url"
        tar -xzf "$tmpdir/speedtest.tgz" -C "$tmpdir"
-       if [[ -f "$tmpdir/speedtest" ]]; then
-         mv "$tmpdir/speedtest" /usr/bin/speedtest
-         chmod +x /usr/bin/speedtest
-         installed=1
-       fi
+       [[ -f "$tmpdir/speedtest" ]] && mv "$tmpdir/speedtest" /usr/bin/speedtest && chmod +x /usr/bin/speedtest && installed=1
        rm -rf "$tmpdir"
     fi
   fi
-  
-  if [[ "$installed" -eq 0 ]]; then
-    echo -e "${RED}Speedtest 安装失败。请检查网络或手动安装。${PLAIN}"
-    return 1
-  fi
+  [[ "$installed" -eq 0 ]] && return 1
 }
 
 run_ookla_speedtest(){
-  if ! command -v speedtest >/dev/null 2>&1; then install_ookla_speedtest || return; fi
+  if ! command -v speedtest >/dev/null 2>&1; then install_ookla_speedtest || { echo -e "${RED}安装失败${PLAIN}"; return; }; fi
   echo -e "\n${BLUE}========== Speedtest by Ookla ==========${PLAIN}"
-  echo -e "回车使用自动节点，或输入 Server ID 指定节点。"
-  read -p "Server ID (可选): " sid
-  if [[ ! -f ~/.config/ookla/speedtest-cli.json ]]; then
-    speedtest --accept-license --accept-gdpr >/dev/null 2>&1
-  fi
-  echo -e "${CYAN}启动测速...${PLAIN}\n"
-  if [[ -n "$sid" ]]; then
-    speedtest --server-id="$sid" --progress=yes
-  else
-    speedtest --progress=yes
-  fi
+  read -p "Server ID (可选, 回车自动): " sid
+  if [[ ! -f ~/.config/ookla/speedtest-cli.json ]]; then speedtest --accept-license --accept-gdpr >/dev/null 2>&1; fi
+  if [[ -n "$sid" ]]; then speedtest --server-id="$sid" --progress=yes; else speedtest --progress=yes; fi
   echo -e "${BLUE}========================================${PLAIN}"
 }
 
-# ----------------- 8) Live Monitor (Cleaned) -----------------
+# ----------------- 9) Monitor -----------------
 monitor_stats(){
   clear
   while true; do
-    # 原地刷新逻辑
     if command -v tput >/dev/null 2>&1; then tput cup 0 0; else clear; fi
-
     echo -e "${BLUE}=== 实时流量监控 [按回车返回] ===${PLAIN}"
     echo -e "刷新时间: $(date +%T)"
     echo -e "----------------------------------------------------"
     printf "%-6s %-6s %-4s %-8s %-10s %-8s\n" "TYPE" "PORT" "DIR" "LIMIT" "SENT" "DROP"
     echo -e "----------------------------------------------------"
-    
     if [[ ! -s "$DB_FILE" ]]; then
-      echo -e "${YELLOW}   (当前无限速规则)${PLAIN}"
-      echo ""; echo ""
+      echo -e "${YELLOW}   (当前无限速规则)${PLAIN}"; echo ""; echo ""
     else
       while IFS='|' read -r type key dir mbps ts meta; do
-         local dev="$INTERFACE"
-         local classid=""
-         local sent="-"
-         local dropped="0"
-         
+         local dev="$INTERFACE"; local classid=""; local sent="-"; local dropped="0"
          if [[ "$type" == "XRAY" && "$dir" == "out" ]]; then classid="1:200"; fi
          if [[ "$type" == "XRAY" && "$dir" == "in" ]]; then dev="$IFB_DEV"; classid="1:201"; fi
          if [[ "$type" == "PORT" ]]; then
              local m; m="$(echo "$meta" | grep -o "minor=[0-9a-f]*" | cut -d= -f2)"
-             [[ -n "$m" ]] && classid="1:$m"
-             [[ "$dir" == "in" ]] && dev="$IFB_DEV"
+             [[ -n "$m" ]] && classid="1:$m"; [[ "$dir" == "in" ]] && dev="$IFB_DEV"
          fi
-
          if [[ -n "$classid" ]]; then
            local raw; raw="$(tc -s class show dev "$dev" classid "$classid" 2>/dev/null)"
            if [[ -n "$raw" ]]; then
@@ -542,53 +599,44 @@ monitor_stats(){
              [[ -n "$drop" ]] && dropped="$drop"
            fi
          fi
-         
          printf "%-6s %-6s %-4s %-8s %-10s " "$type" "$key" "$dir" "${mbps}M" "$sent"
-         if [[ "$dropped" != "0" && "$dropped" != "-" ]]; then
-             echo -e "${RED}${dropped}${PLAIN}"
-         else
-             echo -e "${dropped}"
-         fi
+         if [[ "$dropped" != "0" && "$dropped" != "-" ]]; then echo -e "${RED}${dropped}${PLAIN}"; else echo -e "${dropped}"; fi
       done < "$DB_FILE"
     fi
     echo -e "----------------------------------------------------"
-    
-    # 等待2秒或用户输入
-    read -t 2 -n 1 -s -r
-    if [[ $? -eq 0 ]]; then break; fi
+    read -t 2 -n 1 -s -r; if [[ $? -eq 0 ]]; then break; fi
   done
 }
 
-# ----------------- 9) Uninstall -----------------
+# ----------------- 10) Uninstall -----------------
 do_uninstall(){
   echo -e "${RED}警告：这将清除所有限速规则并删除脚本配置文件！${PLAIN}"
   read -p "确定要继续吗? (y/N): " confirm
   [[ "$confirm" != "y" ]] && return
   reset_all
   rm -rf "$STATE_DIR"
-  echo -e "${GREEN}卸载完成。${PLAIN}"
-  echo -e "你可以手动删除此脚本: rm $0"
-  exit 0
+  echo -e "${GREEN}卸载完成。${PLAIN}"; echo -e "你可以手动删除此脚本: rm $0"; exit 0
 }
 
 # ----------------- Menu -----------------
 show_menu(){
   clear
   echo -e "=================================================="
-  echo -e "   VPS 流量控制台 V10.9 (Final)"
+  echo -e "   VPS 流量控制台 V10.11 (Smart Port Select)"
   echo -e "   网卡: ${GREEN}${INTERFACE}${PLAIN} | IFB: ${GREEN}${IFB_DEV}${PLAIN}"
   echo -e "   nftables: $(has_nft && echo -e "${GREEN}OK${PLAIN}" || echo -e "${YELLOW}缺失${PLAIN}")"
   echo -e "=================================================="
-  echo -e "1. 监听端口 (列表)"
+  echo -e "1. 监听端口 (纯列表)"
   echo -e "2. 限制 Xray 速度 (Docker/UID)"
-  echo -e "3. 限制 特定端口 速率 (手动)"
-  echo -e "4. 查看限速清单"
-  echo -e "5. 移除 Xray 限速"
-  echo -e "6. 全部重置 (Reset)"
+  echo -e "3. ${GREEN}限制 特定端口 速率 (序号点选)${PLAIN}"
+  echo -e "4. 移除 特定端口 限速"
+  echo -e "5. 查看限速清单"
+  echo -e "6. 移除 Xray 限速"
+  echo -e "7. 全部重置 (Reset)"
   echo -e "--------------------------------------------------"
-  echo -e "7. Speedtest (Ookla 官方版)"
-  echo -e "8. 实时流量监控 (Live Monitor)"
-  echo -e "9. 彻底卸载与清理"
+  echo -e "8. Speedtest (Ookla 官方版)"
+  echo -e "9. 实时流量监控 (Live Monitor)"
+  echo -e "10. 彻底卸载与清理"
   echo -e "0. 退出"
   echo -e "=================================================="
   read -p "选择: " c
@@ -597,12 +645,13 @@ show_menu(){
     1) menu_list_ports; read -p "回车返回..." ;;
     2) menu_set_xray_limits; read -p "回车返回..." ;;
     3) menu_port_limit; read -p "回车返回..." ;;
-    4) show_limits; read -p "回车返回..." ;;
-    5) menu_remove_xray_limits; read -p "回车返回..." ;;
-    6) reset_all; read -p "回车返回..." ;;
-    7) run_ookla_speedtest; read -p "回车返回..." ;;
-    8) monitor_stats ;;
-    9) do_uninstall ;;
+    4) menu_remove_port_limit; read -p "回车返回..." ;;
+    5) show_limits; read -p "回车返回..." ;;
+    6) menu_remove_xray_limits; read -p "回车返回..." ;;
+    7) reset_all; read -p "回车返回..." ;;
+    8) run_ookla_speedtest; read -p "回车返回..." ;;
+    9) monitor_stats ;;
+    10) do_uninstall ;;
     0) exit 0 ;;
     *) show_menu ;;
   esac
