@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==================================================
-# VPS 流量控制台 V10.16 (Global Nodes Expanded)
+# VPS 流量控制台 V10.18 (All-in-One Nodes + 2-Col Layout)
 #
 # 功能全集：
 # 1) 监听端口 (列表)
@@ -10,13 +10,14 @@
 # 5) 查看限速清单
 # 6) 移除 Xray 限速
 # 7) 全部重置
-# 8) [升级] Speedtest (新增至19个全球核心节点)
+# 8) [升级] Speedtest (国内+广电+国际，双列显示)
 # 9) 实时流量监控
 # 10) 彻底卸载
 #
-# 修改记录 V10.16:
-# - [新增] Speedtest 增加台湾、韩国、英国、法国、荷兰、俄罗斯等地区节点
-# - [优化] 节点列表按大洲分类显示
+# 修改记录 V10.18:
+# - [恢复] 恢复国内三大运营商节点
+# - [新增] 增加中国广电 (Broadnet) 节点
+# - [优化] 节点列表改为双列显示，防止刷屏
 # ==================================================
 
 set -u
@@ -560,7 +561,7 @@ reset_all(){
   echo -e "${GREEN}已重置所有 TC/NFT 规则${PLAIN}"
 }
 
-# ----------------- 8) Speedtest (Global 20+) -----------------
+# ----------------- 8) Speedtest (2-Col Layout) -----------------
 install_ookla_speedtest(){
   echo -e "${YELLOW}检测到未安装 speedtest，正在安装...${PLAIN}"
   local installed=0
@@ -591,55 +592,62 @@ run_ookla_speedtest(){
   if ! command -v speedtest >/dev/null 2>&1; then install_ookla_speedtest || { echo -e "${RED}安装失败${PLAIN}"; return; }; fi
   
   echo -e "\n${BLUE}========== Speedtest by Ookla (Global Nodes) ==========${PLAIN}"
-  echo -e "${YELLOW}--- 亚洲 (Asia) ---${PLAIN}"
-  echo -e " 1) 13538   香港 (Hong Kong | STC)"
-  echo -e " 2) 1536    香港 (Hong Kong | CSL)"
-  echo -e " 3) 15693   台湾 (Taiwan | Chief)"
-  echo -e " 4) 21569   日本 (Tokyo | IPA)"
-  echo -e " 5) 48463   日本 (Rakuten Mobile)"
-  echo -e " 6) 26685   韩国 (Seoul | Kdatacenter)"
-  echo -e " 7) 13623   新加坡 (Singapore | Singtel)"
+  echo -e "${YELLOW}--- 中国国内 (China Domestic) ---${PLAIN}"
+  printf "%-36s | %-36s\n" "1) 3633 (电信|上海)" "2) 27594 (电信|南京)"
+  printf "%-36s | %-36s\n" "3) 27377 (电信|合肥)" "4) 24447 (联通|上海)"
+  printf "%-36s | %-36s\n" "5) 4870 (联通|长沙)" "6) 16803 (移动|上海)"
+  printf "%-36s | %-36s\n" "7) 25858 (移动|北京)" "8) 55299 (广电|南京)"
+  printf "%-36s\n" "9) 58529 (广电|北京)"
   
-  echo -e "${YELLOW}--- 美洲 (Americas) ---${PLAIN}"
-  echo -e " 8) 17383   美国 (Los Angeles | AT&T)"
-  echo -e " 9) 14236   美国 (San Jose | Dish)"
-  echo -e "10) 5029    美国 (New York | AT&T)"
-  echo -e "11) 17625   加拿大 (Toronto | Bell)"
-  echo -e "12) 25968   巴西 (Sao Paulo | Claro)"
+  echo -e "\n${YELLOW}--- 亚洲邻国 (Asia Nearby) ---${PLAIN}"
+  printf "%-36s | %-36s\n" "10) 13538 (香港|STC)" "11) 1536 (香港|CSL)"
+  printf "%-36s | %-36s\n" "12) 18445 (台湾|中华电信)" "13) 21569 (日本|IPA)"
+  printf "%-36s | %-36s\n" "14) 48463 (日本|Rakuten)" "15) 26685 (韩国|Kdatacenter)"
+  printf "%-36s\n" "16) 13623 (新加坡|Singtel)"
   
-  echo -e "${YELLOW}--- 欧洲 (Europe) ---${PLAIN}"
-  echo -e "13) 35055   英国 (London | Community Fibre)"
-  echo -e "14) 31120   德国 (Frankfurt | 23Media)"
-  echo -e "15) 5559    法国 (Paris | Orange)"
-  echo -e "16) 5252    荷兰 (Amsterdam | KPN)"
-  echo -e "17) 2361    俄罗斯 (Moscow | Rostelecom)"
+  echo -e "\n${YELLOW}--- 欧美/其他 (Global Others) ---${PLAIN}"
+  printf "%-36s | %-36s\n" "17) 17383 (美国|洛杉矶)" "18) 14236 (美国|圣何塞)"
+  printf "%-36s | %-36s\n" "19) 5029 (美国|纽约)" "20) 30537 (加拿大|Rogers)"
+  printf "%-36s | %-36s\n" "21) 35055 (英国|伦敦)" "22) 31120 (德国|法兰克福)"
+  printf "%-36s | %-36s\n" "23) 1688 (法国|Bouygues)" "24) 5252 (荷兰|KPN)"
+  printf "%-36s | %-36s\n" "25) 1907 (俄罗斯|MTS)" "26) 3234 (澳洲|Vodafone)"
+  printf "%-36s | %-36s\n" "27) 20562 (巴西|TIM)" "28) 25345 (印度|Jio)"
+  printf "%-36s\n" "29) 27357 (迪拜|du)"
   
-  echo -e "${YELLOW}--- 大洋洲 (Oceania) ---${PLAIN}"
-  echo -e "18) 2627    澳大利亚 (Sydney | Telstra)"
-  
-  echo -e "----------------------------------------"
+  echo -e "------------------------------------------------------------------------"
   read -p "请输入序号/ID (直接回车自动): " selection
   
   local sid=""
   case "$selection" in
-    1) sid="13538" ;;
-    2) sid="1536" ;;
-    3) sid="15693" ;;
-    4) sid="21569" ;;
-    5) sid="48463" ;;
-    6) sid="26685" ;;
-    7) sid="13623" ;;
-    8) sid="17383" ;;
-    9) sid="14236" ;;
-    10) sid="5029" ;;
-    11) sid="17625" ;;
-    12) sid="25968" ;;
-    13) sid="35055" ;;
-    14) sid="31120" ;;
-    15) sid="5559" ;;
-    16) sid="5252" ;;
-    17) sid="2361" ;;
-    18) sid="2627" ;;
+    1) sid="3633" ;;
+    2) sid="27594" ;;
+    3) sid="27377" ;;
+    4) sid="24447" ;;
+    5) sid="4870" ;;
+    6) sid="16803" ;;
+    7) sid="25858" ;;
+    8) sid="55299" ;;
+    9) sid="58529" ;;
+    10) sid="13538" ;;
+    11) sid="1536" ;;
+    12) sid="18445" ;;
+    13) sid="21569" ;;
+    14) sid="48463" ;;
+    15) sid="26685" ;;
+    16) sid="13623" ;;
+    17) sid="17383" ;;
+    18) sid="14236" ;;
+    19) sid="5029" ;;
+    20) sid="30537" ;;
+    21) sid="35055" ;;
+    22) sid="31120" ;;
+    23) sid="1688" ;;
+    24) sid="5252" ;;
+    25) sid="1907" ;;
+    26) sid="3234" ;;
+    27) sid="20562" ;;
+    28) sid="25345" ;;
+    29) sid="27357" ;;
     "") sid="" ;;
     *) sid="$selection" ;; # 手动输入ID
   esac
@@ -713,7 +721,7 @@ do_uninstall(){
 show_menu(){
   clear
   echo -e "=================================================="
-  echo -e "   VPS 流量控制台 V10.16 (Global Nodes)"
+  echo -e "   VPS 流量控制台 V10.18 (All-in-One Nodes)"
   echo -e "   网卡: ${GREEN}${INTERFACE}${PLAIN} | IFB: ${GREEN}${IFB_DEV}${PLAIN}"
   echo -e "   nftables: $(has_nft && echo -e "${GREEN}OK${PLAIN}" || echo -e "${YELLOW}缺失${PLAIN}")"
   echo -e "=================================================="
@@ -725,7 +733,7 @@ show_menu(){
   echo -e "6. 移除 Xray 限速"
   echo -e "7. 全部重置 (Reset)"
   echo -e "--------------------------------------------------"
-  echo -e "8. Speedtest (含19+全球节点)"
+  echo -e "8. Speedtest (国内+广电+国际)"
   echo -e "9. 实时流量监控 (Live Monitor)"
   echo -e "10. 彻底卸载与清理"
   echo -e "0. 退出"
