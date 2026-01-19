@@ -18,16 +18,11 @@
 # - [修复] 子菜单输入 0 后立即返回主菜单，不再需要二次回车
 # - [优化] 错误提示和操作成功提示的停留逻辑
 #
-# CentOS/RHEL 全系支持增强（不改变原架构/功能）：
-# - 兼容 dnf/yum makecache
-# - 自动补齐最小化系统缺失依赖（如 tar/curl/iproute/tc/ss 等）
-#
-# Speedtest 安装稳妥方案（不动其他功能）：
-# - 优先 repo 安装（dnf/yum/apt）
-# - 失败自动回退官方 tgz 二进制
-# - 下载阶段显示真实进度条（curl --progress-bar）
-# - 包管理安装阶段显示跑动进度条（spinner）
-# - 失败时输出最后 80 行安装日志，便于排障
+# CentOS 7.9 修复点（不改变原功能/架构）：
+# - CentOS7 常无 nftables：为“Xray 出站标记”增加 iptables(mangle+owner) 兜底
+# - 菜单 nftables 状态：若无 nft 但可用 iptables，则显示 OK(iptables) 而不是 缺失
+# - reset / 移除 Xray 限速时同步清理 iptables 规则
+# - 依赖检查补充 iptables
 # ==================================================
 
 set -u
@@ -71,8 +66,8 @@ ensure_deps(){
   local mgr; mgr="$(detect_pkg_mgr)"
   [[ -z "$mgr" ]] && return 0
 
-  # 保持与你原来依赖检查一致
-  local need_cmds=(ip tc ss awk sed grep cut tr uname date mkdir mv rm modprobe ps id curl head wc mktemp cat tar)
+  # 追加 iptables（CentOS7 nftables 常缺，iptables 必须在）
+  local need_cmds=(ip tc ss awk sed grep cut tr uname date mkdir mv rm modprobe ps id curl head wc mktemp cat tar iptables)
 
   local missing=()
   for c in "${need_cmds[@]}"; do
@@ -83,15 +78,13 @@ ensure_deps(){
   echo -e "${YELLOW}检测到缺失依赖：${missing[*]}，尝试自动安装...${PLAIN}"
 
   if [[ "$mgr" == "dnf" || "$mgr" == "yum" ]]; then
-    # RHEL/CentOS/Rocky/Alma 等
-    local pkgs=(iproute tar curl kmod procps-ng coreutils gawk grep sed util-linux)
-    pkgs+=(nftables)
+    local pkgs=(iproute tar curl kmod procps-ng coreutils gawk grep sed util-linux iptables)
+    pkgs+=(nftables) # 能装就装，装不了也不影响（有 iptables 兜底）
     install_pkgs "$mgr" "${pkgs[@]}" >/dev/null 2>&1 || true
   else
-    install_pkgs "$mgr" iproute2 iproute2-tc tar curl kmod procps gawk grep sed coreutils util-linux nftables >/dev/null 2>&1 || true
+    install_pkgs "$mgr" iproute2 iproute2-tc tar curl kmod procps gawk grep sed coreutils util-linux iptables nftables >/dev/null 2>&1 || true
   fi
 
-  # 仍缺则按原语义退出（不改变失败逻辑）
   for c in "${missing[@]}"; do
     command -v "$c" >/dev/null 2>&1 || { echo -e "${RED}缺少命令: $c${PLAIN}"; exit 1; }
   done
@@ -116,15 +109,23 @@ else
 fi
 echo -e "${GREEN}系统软件源更新完成！${PLAIN}\n"
 
-# 先补依赖，再做强校验（避免最小化系统直接退出）
+# 先补依赖，再做强校验
 ensure_deps
 
-for cmd in ip tc ss awk sed grep cut tr uname date mkdir mv rm modprobe ps id curl head wc mktemp cat tar; do
+for cmd in ip tc ss awk sed grep cut tr uname date mkdir mv rm modprobe ps id curl head wc mktemp cat tar iptables; do
   command -v "$cmd" >/dev/null 2>&1 || { echo -e "${RED}缺少命令: $cmd${PLAIN}"; exit 1; }
 done
 
 has_nft(){ command -v nft >/dev/null 2>&1; }
+has_iptables(){ command -v iptables >/dev/null 2>&1; }
 has_flower(){ tc filter help 2>/dev/null | grep -qi flower; }
+
+# nft/iptables 标记后端状态（用于菜单显示）
+mark_status(){
+  if has_nft; then echo -e "${GREEN}OK${PLAIN}"; return; fi
+  if has_iptables; then echo -e "${GREEN}OK(iptables)${PLAIN}"; return; fi
+  echo -e "${YELLOW}缺失${PLAIN}"
+}
 
 INTERFACE="$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')"
 [[ -z "$INTERFACE" ]] && echo -e "${RED}错误：无法识别主网卡（ip route get 8.8.8.8 失败）${PLAIN}" && exit 1
@@ -183,6 +184,20 @@ db_delete_prefix(){
   mv -f "${DB_FILE}.tmp" "$DB_FILE" >/dev/null 2>&1 || true
 }
 
+# ---------------- iptables cleanup for XRAY mark ----------------
+iptables_cleanup_xray_mark(){
+  has_iptables || return 0
+  # 删除 OUTPUT 链中 owner+MARK 的规则（只针对 set-mark=XRAY_MARK_DEC）
+  # 将 -A 替换成 -D 逐条删除
+  iptables -t mangle -S OUTPUT 2>/dev/null | \
+    grep -E "^-A OUTPUT .* -m owner --uid-owner [0-9]+ .* -j MARK .*(${XRAY_MARK_DEC}|0x${XRAY_MARK_DEC})" | \
+    while read -r line; do
+      local del="${line/-A OUTPUT/-D OUTPUT}"
+      iptables -t mangle $del >/dev/null 2>&1 || true
+    done
+  return 0
+}
+
 # ---------------- modules & init ----------------
 init_modules(){
   try_modprobe ifb
@@ -193,6 +208,8 @@ init_modules(){
   try_modprobe cls_u32
   try_modprobe cls_fw
   try_modprobe cls_flower
+  # CentOS7: owner match 可能需要模块（失败无所谓）
+  try_modprobe xt_owner
 }
 
 ensure_ifb(){
@@ -313,18 +330,33 @@ detect_xray_uid_auto(){
   echo "$uid"
 }
 
+# 原函数名保留（不改架构），内部增加 iptables 兜底
 ensure_nft_mark_rule(){
   local uid="$1"
-  if ! has_nft; then echo -e "${RED}[FAIL]${PLAIN} 未安装 nftables"; return 1; fi
-  nft list table inet "$NFT_TABLE" >/dev/null 2>&1 || nft add table inet "$NFT_TABLE" >/dev/null 2>&1 || true
-  if ! nft list chain inet "$NFT_TABLE" "$NFT_CHAIN" >/dev/null 2>&1; then
-    nft add chain inet "$NFT_TABLE" "$NFT_CHAIN" "{ type filter hook output priority mangle; policy accept; }" >/dev/null 2>&1 || true
-  fi
-  if nft list chain inet "$NFT_TABLE" "$NFT_CHAIN" 2>/dev/null | grep -q "meta skuid .* meta mark set ${XRAY_MARK_DEC}"; then
+
+  # 1) nftables 优先
+  if has_nft; then
+    nft list table inet "$NFT_TABLE" >/dev/null 2>&1 || nft add table inet "$NFT_TABLE" >/dev/null 2>&1 || true
+    if ! nft list chain inet "$NFT_TABLE" "$NFT_CHAIN" >/dev/null 2>&1; then
+      nft add chain inet "$NFT_TABLE" "$NFT_CHAIN" "{ type filter hook output priority mangle; policy accept; }" >/dev/null 2>&1 || true
+    fi
+    if nft list chain inet "$NFT_TABLE" "$NFT_CHAIN" 2>/dev/null | grep -q "meta skuid .* meta mark set ${XRAY_MARK_DEC}"; then
+      return 0
+    fi
+    run_or_fail "nft add rule" nft add rule inet "$NFT_TABLE" "$NFT_CHAIN" meta skuid "$uid" meta mark set "$XRAY_MARK_DEC" || return 1
     return 0
   fi
-  run_or_fail "nft add rule" nft add rule inet "$NFT_TABLE" "$NFT_CHAIN" meta skuid "$uid" meta mark set "$XRAY_MARK_DEC" || return 1
-  return 0
+
+  # 2) CentOS7 常见：无 nftables -> 用 iptables mangle + owner 做标记
+  if has_iptables; then
+    # 规则是否存在
+    iptables -t mangle -C OUTPUT -m owner --uid-owner "$uid" -j MARK --set-mark "$XRAY_MARK_DEC" >/dev/null 2>&1 && return 0
+    run_or_fail "iptables add MARK rule" iptables -t mangle -A OUTPUT -m owner --uid-owner "$uid" -j MARK --set-mark "$XRAY_MARK_DEC" || return 1
+    return 0
+  fi
+
+  echo -e "${RED}[FAIL]${PLAIN} nftables/iptables 均不可用，无法对 Xray 出站进行标记"
+  return 1
 }
 
 apply_xray_out_limit(){
@@ -366,7 +398,6 @@ apply_xray_in_limit(){
   local ports; ports="$(get_xray_listen_ports)"
   [[ -z "$ports" ]] && { echo -e "${RED}[FAIL]${PLAIN} 未检测到 xray 监听端口"; return 1; }
 
-  local count; count="$(echo "$ports" | wc -l | tr -d ' ')"
   local rate_kbit=$((mbps * 1000))
   local handle_hex="0201"
 
@@ -649,20 +680,28 @@ menu_remove_xray_limits(){
   if [[ "$sel" == "0" ]]; then return; fi
 
   init_all >/dev/null 2>&1 || true
+
   [[ "$sel" == "1" || "$sel" == "3" ]] && {
      tc filter del dev "$INTERFACE" parent 1:0 protocol all prio 10 >/dev/null 2>&1 || true
      tc qdisc  del dev "$INTERFACE" parent "$XRAY_OUT_CLASSID" >/dev/null 2>&1 || true
      tc class  del dev "$INTERFACE" parent 1:1 classid "$XRAY_OUT_CLASSID" >/dev/null 2>&1 || true
+
+     # nft 规则清理
      has_nft && nft delete table inet "$NFT_TABLE" >/dev/null 2>&1 || true
+     # iptables 兜底清理
+     iptables_cleanup_xray_mark
+
      db_delete_prefix "XRAY" "OUT"
      echo -e "${GREEN}Xray 出站限制已移除${PLAIN}"
   }
+
   [[ "$sel" == "2" || "$sel" == "3" ]] && {
      tc qdisc del dev "$IFB_DEV" parent "$XRAY_IN_CLASSID" >/dev/null 2>&1 || true
      tc class del dev "$IFB_DEV" parent 1:1 classid "$XRAY_IN_CLASSID" >/dev/null 2>&1 || true
      db_delete_prefix "XRAY" "IN"
      echo -e "${GREEN}Xray 入站限制已移除${PLAIN}"
   }
+
   read -p "操作完成，按回车返回..."
 }
 
@@ -673,83 +712,47 @@ reset_all(){
   tc qdisc del dev "$IFB_DEV" root >/dev/null 2>&1 || true
   ip link set dev "$IFB_DEV" down >/dev/null 2>&1 || true
   ip link del dev "$IFB_DEV" >/dev/null 2>&1 || true
+
+  # nft/iptables 清理（CentOS7 关键）
   has_nft && nft delete table inet "$NFT_TABLE" >/dev/null 2>&1 || true
+  iptables_cleanup_xray_mark
+
   : > "$DB_FILE"
-  echo -e "${GREEN}已重置所有 TC/NFT 规则${PLAIN}"
+  echo -e "${GREEN}已重置所有 TC/NFT/iptables 规则${PLAIN}"
   read -p "操作完成，按回车返回..."
 }
 
 # ----------------- 8) Speedtest -----------------
-# -------- Speedtest 安装进度条 & 日志（仅影响安装过程，不动其他） --------
-SPIN_CHARS='|/-\'
-
-run_with_spinner() {
-  # run_with_spinner "msg" "logfile" command...
-  local msg="$1"; shift
-  local logf="$1"; shift
-  local i=0
-  echo -ne "${CYAN}${msg}${PLAIN} "
-  ( "$@" ) >"$logf" 2>&1 &
-  local pid=$!
-  while kill -0 "$pid" 2>/dev/null; do
-    printf "\b%s" "${SPIN_CHARS:i%4:1}"
-    i=$((i+1))
-    sleep 0.1
-  done
-  wait "$pid"
-  local rc=$?
-  if [[ $rc -eq 0 ]]; then
-    echo -e "\b${GREEN}OK${PLAIN}"
-  else
-    echo -e "\b${RED}FAIL${PLAIN}"
-  fi
-  return $rc
-}
-
-curl_dl_bar() {
-  # curl_dl_bar URL OUT
-  local url="$1" out="$2"
-  curl -L --fail --progress-bar -o "$out" "$url"
-}
-
-tail_log_hint() {
-  local logf="$1"
-  echo -e "${YELLOW}--- 安装日志(最后 80 行) ---${PLAIN}"
-  tail -n 80 "$logf" 2>/dev/null || true
-  echo -e "${YELLOW}---------------------------${PLAIN}"
-}
-
 install_ookla_speedtest(){
   echo -e "${YELLOW}检测到未安装 speedtest，正在安装...${PLAIN}"
   local tmpdir; tmpdir="$(mktemp -d)"
   local logf="${tmpdir}/speedtest_install.log"
   local installed=0
 
-  # 0) 先尽量补齐证书/基础工具（最小化系统常缺）
-  if [ -f /etc/debian_version ]; then
-    run_with_spinner "准备依赖(apt)..." "$logf" bash -c '
-      set -e
-      apt-get update -y
-      DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl tar >/dev/null
-      update-ca-certificates >/dev/null 2>&1 || true
-    ' || true
-  elif [ -f /etc/redhat-release ]; then
-    if command -v dnf >/dev/null 2>&1; then
-      run_with_spinner "准备依赖(dnf)..." "$logf" bash -c '
-        set -e
-        dnf -y install ca-certificates curl tar >/dev/null
-        update-ca-trust >/dev/null 2>&1 || true
-      ' || true
-    else
-      run_with_spinner "准备依赖(yum)..." "$logf" bash -c '
-        set -e
-        yum -y install ca-certificates curl tar >/dev/null
-        update-ca-trust >/dev/null 2>&1 || true
-      ' || true
-    fi
-  fi
+  SPIN_CHARS='|/-\'
+  run_with_spinner() {
+    local msg="$1"; shift
+    local lf="$1"; shift
+    local i=0
+    echo -ne "${CYAN}${msg}${PLAIN} "
+    ( "$@" ) >"$lf" 2>&1 &
+    local pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+      printf "\b%s" "${SPIN_CHARS:i%4:1}"
+      i=$((i+1))
+      sleep 0.1
+    done
+    wait "$pid"; local rc=$?
+    if [[ $rc -eq 0 ]]; then echo -e "\b${GREEN}OK${PLAIN}"; else echo -e "\b${RED}FAIL${PLAIN}"; fi
+    return $rc
+  }
+  curl_dl_bar() { curl -L --fail --progress-bar -o "$2" "$1"; }
+  tail_log_hint() {
+    echo -e "${YELLOW}--- 安装日志(最后 80 行) ---${PLAIN}"
+    tail -n 80 "$1" 2>/dev/null || true
+    echo -e "${YELLOW}---------------------------${PLAIN}"
+  }
 
-  # 1) 优先 repo 安装（更系统化）
   if [ -f /etc/debian_version ]; then
     run_with_spinner "配置并安装 speedtest(apt)..." "$logf" bash -c '
       set -e
@@ -775,7 +778,6 @@ install_ookla_speedtest(){
     fi
   fi
 
-  # 2) repo 失败则输出日志并回退官方 tgz（二进制）——最稳妥兜底
   if [[ "$installed" -eq 0 ]]; then
     echo -e "${YELLOW}Repo 安装失败，切换到官方二进制包安装（下载带真实进度条）...${PLAIN}"
     tail_log_hint "$logf"
@@ -785,27 +787,19 @@ install_ookla_speedtest(){
     case "$arch" in
       x86_64) url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz" ;;
       aarch64|arm64) url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz" ;;
-      *)
-        echo -e "${RED}不支持的架构: ${arch}${PLAIN}"
-        rm -rf "$tmpdir"
-        return 1
-        ;;
+      *) echo -e "${RED}不支持的架构: ${arch}${PLAIN}"; rm -rf "$tmpdir"; return 1 ;;
     esac
 
     local tgz="${tmpdir}/speedtest.tgz"
     echo -e "${CYAN}下载 speedtest 二进制包中...${PLAIN}"
     if ! curl_dl_bar "$url" "$tgz"; then
-      echo -e "${RED}下载失败：无法访问 install.speedtest.net（多为 DNS/网络/出站策略）${PLAIN}"
+      echo -e "${RED}下载失败：无法访问 install.speedtest.net${PLAIN}"
       rm -rf "$tmpdir"
       return 1
     fi
 
     echo -e "${CYAN}解压并安装中...${PLAIN}"
-    tar -xzf "$tgz" -C "$tmpdir" >/dev/null 2>&1 || {
-      echo -e "${RED}解压失败（tar/文件损坏）${PLAIN}"
-      rm -rf "$tmpdir"
-      return 1
-    }
+    tar -xzf "$tgz" -C "$tmpdir" >/dev/null 2>&1 || { echo -e "${RED}解压失败${PLAIN}"; rm -rf "$tmpdir"; return 1; }
 
     if [[ -f "${tmpdir}/speedtest" ]]; then
       mv -f "${tmpdir}/speedtest" /usr/bin/speedtest
@@ -825,7 +819,7 @@ install_ookla_speedtest(){
 
 run_ookla_speedtest(){
   if ! command -v speedtest >/dev/null 2>&1; then
-    install_ookla_speedtest || { echo -e "${RED}安装失败：请根据上面输出日志排查（常见：repo/GPG/DNS/网络）${PLAIN}"; read -p "回车返回..."; return; }
+    install_ookla_speedtest || { echo -e "${RED}安装失败${PLAIN}"; read -p "回车返回..."; return; }
   fi
 
   echo -e "\n${BLUE}========== Speedtest by Ookla (Global + Domestic) ==========${PLAIN}"
@@ -852,7 +846,6 @@ run_ookla_speedtest(){
   echo -e "------------------------------------------------------------------------"
   echo -e "0) 返回主菜单"
   read -p "请输入序号/ID (直接回车自动, 0返回): " selection
-
   if [[ "$selection" == "0" ]]; then return; fi
 
   local sid=""
@@ -886,13 +879,8 @@ run_ookla_speedtest(){
   esac
 
   if [[ ! -f ~/.config/ookla/speedtest-cli.json ]]; then speedtest --accept-license --accept-gdpr >/dev/null 2>&1; fi
-
   echo -e "${CYAN}正在连接测速服务器...${PLAIN}\n"
-  if [[ -n "$sid" ]]; then
-      speedtest --server-id="$sid" --progress=yes
-  else
-      speedtest --progress=yes
-  fi
+  if [[ -n "$sid" ]]; then speedtest --server-id="$sid" --progress=yes; else speedtest --progress=yes; fi
   echo -e "${BLUE}========================================${PLAIN}"
   read -p "测试完成，按回车返回..."
 }
@@ -957,7 +945,7 @@ show_menu(){
   echo -e "=================================================="
   echo -e "   VPS 流量控制台 V10.22 (Zero-Latency Return)"
   echo -e "   网卡: ${GREEN}${INTERFACE}${PLAIN} | IFB: ${GREEN}${IFB_DEV}${PLAIN}"
-  echo -e "   nftables: $(has_nft && echo -e "${GREEN}OK${PLAIN}" || echo -e "${YELLOW}缺失${PLAIN}")"
+  echo -e "   nftables: $(mark_status)"
   echo -e "=================================================="
   echo -e "1. 监听端口 (列表)"
   echo -e "2. 限制 Xray 速度 (Docker/UID)"
