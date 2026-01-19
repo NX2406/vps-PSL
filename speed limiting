@@ -21,6 +21,13 @@
 # CentOS/RHEL 全系支持增强（不改变原架构/功能）：
 # - 兼容 dnf/yum makecache
 # - 自动补齐最小化系统缺失依赖（如 tar/curl/iproute/tc/ss 等）
+#
+# Speedtest 安装稳妥方案（不动其他功能）：
+# - 优先 repo 安装（dnf/yum/apt）
+# - 失败自动回退官方 tgz 二进制
+# - 下载阶段显示真实进度条（curl --progress-bar）
+# - 包管理安装阶段显示跑动进度条（spinner）
+# - 失败时输出最后 80 行安装日志，便于排障
 # ==================================================
 
 set -u
@@ -77,13 +84,10 @@ ensure_deps(){
 
   if [[ "$mgr" == "dnf" || "$mgr" == "yum" ]]; then
     # RHEL/CentOS/Rocky/Alma 等
-    # ip/tc/ss -> iproute; modprobe -> kmod; ps -> procps-ng
     local pkgs=(iproute tar curl kmod procps-ng coreutils gawk grep sed util-linux)
-    # nftables 可选（脚本本身是可选依赖），但装上能少踩坑
     pkgs+=(nftables)
     install_pkgs "$mgr" "${pkgs[@]}" >/dev/null 2>&1 || true
   else
-    # Debian/Ubuntu
     install_pkgs "$mgr" iproute2 iproute2-tc tar curl kmod procps gawk grep sed coreutils util-linux nftables >/dev/null 2>&1 || true
   fi
 
@@ -676,38 +680,153 @@ reset_all(){
 }
 
 # ----------------- 8) Speedtest -----------------
+# -------- Speedtest 安装进度条 & 日志（仅影响安装过程，不动其他） --------
+SPIN_CHARS='|/-\'
+
+run_with_spinner() {
+  # run_with_spinner "msg" "logfile" command...
+  local msg="$1"; shift
+  local logf="$1"; shift
+  local i=0
+  echo -ne "${CYAN}${msg}${PLAIN} "
+  ( "$@" ) >"$logf" 2>&1 &
+  local pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    printf "\b%s" "${SPIN_CHARS:i%4:1}"
+    i=$((i+1))
+    sleep 0.1
+  done
+  wait "$pid"
+  local rc=$?
+  if [[ $rc -eq 0 ]]; then
+    echo -e "\b${GREEN}OK${PLAIN}"
+  else
+    echo -e "\b${RED}FAIL${PLAIN}"
+  fi
+  return $rc
+}
+
+curl_dl_bar() {
+  # curl_dl_bar URL OUT
+  local url="$1" out="$2"
+  curl -L --fail --progress-bar -o "$out" "$url"
+}
+
+tail_log_hint() {
+  local logf="$1"
+  echo -e "${YELLOW}--- 安装日志(最后 80 行) ---${PLAIN}"
+  tail -n 80 "$logf" 2>/dev/null || true
+  echo -e "${YELLOW}---------------------------${PLAIN}"
+}
+
 install_ookla_speedtest(){
   echo -e "${YELLOW}检测到未安装 speedtest，正在安装...${PLAIN}"
+  local tmpdir; tmpdir="$(mktemp -d)"
+  local logf="${tmpdir}/speedtest_install.log"
   local installed=0
+
+  # 0) 先尽量补齐证书/基础工具（最小化系统常缺）
   if [ -f /etc/debian_version ]; then
-    curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash >/dev/null 2>&1
-    apt-get update >/dev/null 2>&1 && apt-get install -y speedtest >/dev/null 2>&1 && installed=1
+    run_with_spinner "准备依赖(apt)..." "$logf" bash -c '
+      set -e
+      apt-get update -y
+      DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl tar >/dev/null
+      update-ca-certificates >/dev/null 2>&1 || true
+    ' || true
   elif [ -f /etc/redhat-release ]; then
-    curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.rpm.sh | bash >/dev/null 2>&1
     if command -v dnf >/dev/null 2>&1; then
-      dnf install -y speedtest >/dev/null 2>&1 && installed=1
+      run_with_spinner "准备依赖(dnf)..." "$logf" bash -c '
+        set -e
+        dnf -y install ca-certificates curl tar >/dev/null
+        update-ca-trust >/dev/null 2>&1 || true
+      ' || true
     else
-      yum install -y speedtest >/dev/null 2>&1 && installed=1
+      run_with_spinner "准备依赖(yum)..." "$logf" bash -c '
+        set -e
+        yum -y install ca-certificates curl tar >/dev/null
+        update-ca-trust >/dev/null 2>&1 || true
+      ' || true
     fi
   fi
+
+  # 1) 优先 repo 安装（更系统化）
+  if [ -f /etc/debian_version ]; then
+    run_with_spinner "配置并安装 speedtest(apt)..." "$logf" bash -c '
+      set -e
+      curl -fsSL https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash
+      apt-get update -y
+      DEBIAN_FRONTEND=noninteractive apt-get install -y speedtest
+    ' && installed=1
+  elif [ -f /etc/redhat-release ]; then
+    if command -v dnf >/dev/null 2>&1; then
+      run_with_spinner "配置并安装 speedtest(dnf)..." "$logf" bash -c '
+        set -e
+        curl -fsSL https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.rpm.sh | bash
+        dnf -y makecache
+        dnf -y install speedtest
+      ' && installed=1
+    else
+      run_with_spinner "配置并安装 speedtest(yum)..." "$logf" bash -c '
+        set -e
+        curl -fsSL https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.rpm.sh | bash
+        yum -y makecache
+        yum -y install speedtest
+      ' && installed=1
+    fi
+  fi
+
+  # 2) repo 失败则输出日志并回退官方 tgz（二进制）——最稳妥兜底
   if [[ "$installed" -eq 0 ]]; then
-    local arch; arch=$(uname -m)
+    echo -e "${YELLOW}Repo 安装失败，切换到官方二进制包安装（下载带真实进度条）...${PLAIN}"
+    tail_log_hint "$logf"
+
+    local arch; arch="$(uname -m)"
     local url=""
-    [[ "$arch" == "x86_64" ]] && url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz"
-    [[ "$arch" == "aarch64" ]] && url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz"
-    if [[ -n "$url" ]]; then
-       local tmpdir; tmpdir=$(mktemp -d)
-       curl -L -o "$tmpdir/speedtest.tgz" "$url"
-       tar -xzf "$tmpdir/speedtest.tgz" -C "$tmpdir"
-       [[ -f "$tmpdir/speedtest" ]] && mv "$tmpdir/speedtest" /usr/bin/speedtest && chmod +x /usr/bin/speedtest && installed=1
-       rm -rf "$tmpdir"
+    case "$arch" in
+      x86_64) url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz" ;;
+      aarch64|arm64) url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz" ;;
+      *)
+        echo -e "${RED}不支持的架构: ${arch}${PLAIN}"
+        rm -rf "$tmpdir"
+        return 1
+        ;;
+    esac
+
+    local tgz="${tmpdir}/speedtest.tgz"
+    echo -e "${CYAN}下载 speedtest 二进制包中...${PLAIN}"
+    if ! curl_dl_bar "$url" "$tgz"; then
+      echo -e "${RED}下载失败：无法访问 install.speedtest.net（多为 DNS/网络/出站策略）${PLAIN}"
+      rm -rf "$tmpdir"
+      return 1
+    fi
+
+    echo -e "${CYAN}解压并安装中...${PLAIN}"
+    tar -xzf "$tgz" -C "$tmpdir" >/dev/null 2>&1 || {
+      echo -e "${RED}解压失败（tar/文件损坏）${PLAIN}"
+      rm -rf "$tmpdir"
+      return 1
+    }
+
+    if [[ -f "${tmpdir}/speedtest" ]]; then
+      mv -f "${tmpdir}/speedtest" /usr/bin/speedtest
+      chmod +x /usr/bin/speedtest
+      installed=1
+    else
+      echo -e "${RED}安装失败：解压后未找到 speedtest 可执行文件${PLAIN}"
+      rm -rf "$tmpdir"
+      return 1
     fi
   fi
-  [[ "$installed" -eq 0 ]] && return 1
+
+  rm -rf "$tmpdir"
+  command -v speedtest >/dev/null 2>&1 || return 1
+  return 0
 }
 
 run_ookla_speedtest(){
-  if ! command -v speedtest >/dev/null 2>&1; then install_ookla_speedtest || { echo -e "${RED}安装失败${PLAIN}"; read -p "回车返回..."; return; }; fi
+  if ! command -v speedtest >/dev/null 2>&1; then
+    install_ookla_speedtest || { echo -e "${RED}安装失败：请根据上面输出日志排查（常见：repo/GPG/DNS/网络）${PLAIN}"; read -p "回车返回..."; return; }
+  fi
 
   echo -e "\n${BLUE}========== Speedtest by Ookla (Global + Domestic) ==========${PLAIN}"
 
