@@ -14,4 +14,4 @@
 直接在终端执行以下命令即可：
 
 ```bash
-bash <(curl -sL [https://raw.githubusercontent.com/NX2406/vps-PSL/refs/heads/main/speed%20limiting](https://raw.githubusercontent.com/NX2406/vps-PSL/refs/heads/main/speed%20limiting))
+bash <(curl -sL https://raw.githubusercontent.com/NX2406/vps-PSL/refs/heads/main/speed%20limiting)
