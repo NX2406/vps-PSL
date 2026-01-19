@@ -17,6 +17,10 @@
 # 修改记录 V10.22:
 # - [修复] 子菜单输入 0 后立即返回主菜单，不再需要二次回车
 # - [优化] 错误提示和操作成功提示的停留逻辑
+#
+# CentOS/RHEL 全系支持增强（不改变原架构/功能）：
+# - 兼容 dnf/yum makecache
+# - 自动补齐最小化系统缺失依赖（如 tar/curl/iproute/tc/ss 等）
 # ==================================================
 
 set -u
@@ -31,17 +35,85 @@ PLAIN='\033[0m'
 # 1. 权限与环境检查
 [[ ${EUID:-999} -ne 0 ]] && echo -e "${RED}错误：请使用 root 用户运行！${PLAIN}" && exit 1
 
+# ----------------- 依赖自动补齐（CentOS/RHEL/Debian 全系） -----------------
+detect_pkg_mgr(){
+  if command -v apt-get >/dev/null 2>&1; then echo "apt"; return; fi
+  if command -v dnf >/dev/null 2>&1; then echo "dnf"; return; fi
+  if command -v yum >/dev/null 2>&1; then echo "yum"; return; fi
+  echo ""
+}
+
+install_pkgs(){
+  local mgr="$1"; shift
+  local pkgs=("$@")
+  [[ "${#pkgs[@]}" -eq 0 ]] && return 0
+  case "$mgr" in
+    apt)
+      DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1 || true
+      DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}" ;;
+    dnf)
+      dnf -y install "${pkgs[@]}" ;;
+    yum)
+      yum -y install "${pkgs[@]}" ;;
+    *)
+      return 1 ;;
+  esac
+}
+
+ensure_deps(){
+  local mgr; mgr="$(detect_pkg_mgr)"
+  [[ -z "$mgr" ]] && return 0
+
+  # 保持与你原来依赖检查一致
+  local need_cmds=(ip tc ss awk sed grep cut tr uname date mkdir mv rm modprobe ps id curl head wc mktemp cat tar)
+
+  local missing=()
+  for c in "${need_cmds[@]}"; do
+    command -v "$c" >/dev/null 2>&1 || missing+=("$c")
+  done
+  [[ "${#missing[@]}" -eq 0 ]] && return 0
+
+  echo -e "${YELLOW}检测到缺失依赖：${missing[*]}，尝试自动安装...${PLAIN}"
+
+  if [[ "$mgr" == "dnf" || "$mgr" == "yum" ]]; then
+    # RHEL/CentOS/Rocky/Alma 等
+    # ip/tc/ss -> iproute; modprobe -> kmod; ps -> procps-ng
+    local pkgs=(iproute tar curl kmod procps-ng coreutils gawk grep sed util-linux)
+    # nftables 可选（脚本本身是可选依赖），但装上能少踩坑
+    pkgs+=(nftables)
+    install_pkgs "$mgr" "${pkgs[@]}" >/dev/null 2>&1 || true
+  else
+    # Debian/Ubuntu
+    install_pkgs "$mgr" iproute2 iproute2-tc tar curl kmod procps gawk grep sed coreutils util-linux nftables >/dev/null 2>&1 || true
+  fi
+
+  # 仍缺则按原语义退出（不改变失败逻辑）
+  for c in "${missing[@]}"; do
+    command -v "$c" >/dev/null 2>&1 || { echo -e "${RED}缺少命令: $c${PLAIN}"; exit 1; }
+  done
+
+  echo -e "${GREEN}依赖已补齐（或已存在），继续执行...${PLAIN}\n"
+}
+
+# ----------------- 系统更新源（兼容 dnf/yum） -----------------
 echo -e "${YELLOW}正在检测系统类型并更新软件源...${PLAIN}"
 if [ -f /etc/debian_version ]; then
-    echo -e "${BLUE}检测到 Debian/Ubuntu 系统，执行 apt-get update...${PLAIN}"
-    apt-get update
+  echo -e "${BLUE}检测到 Debian/Ubuntu 系统，执行 apt-get update...${PLAIN}"
+  apt-get update
 elif [ -f /etc/redhat-release ]; then
-    echo -e "${BLUE}检测到 CentOS/RedHat 系统，执行 yum makecache...${PLAIN}"
-    yum makecache
+  echo -e "${BLUE}检测到 CentOS/RedHat 系统，执行 makecache...${PLAIN}"
+  if command -v dnf >/dev/null 2>&1; then
+    dnf -y makecache
+  else
+    yum -y makecache
+  fi
 else
-    echo -e "${RED}未识别的操作系统，跳过自动更新。${PLAIN}"
+  echo -e "${RED}未识别的操作系统，跳过自动更新。${PLAIN}"
 fi
 echo -e "${GREEN}系统软件源更新完成！${PLAIN}\n"
+
+# 先补依赖，再做强校验（避免最小化系统直接退出）
+ensure_deps
 
 for cmd in ip tc ss awk sed grep cut tr uname date mkdir mv rm modprobe ps id curl head wc mktemp cat tar; do
   command -v "$cmd" >/dev/null 2>&1 || { echo -e "${RED}缺少命令: $cmd${PLAIN}"; exit 1; }
@@ -221,10 +293,10 @@ list_active_ports(){
   done < <(ss -H -tunlp 2>/dev/null | awk '{print $1, $2, $5, $6, $7}' | sort -k3 -t' ' -n)
   echo -e "------------------------------------------------"
 }
-menu_list_ports(){ 
-  clear; 
-  echo -e "${BLUE}--- 监听端口列表 ---${PLAIN}"; 
-  list_active_ports; 
+menu_list_ports(){
+  clear
+  echo -e "${BLUE}--- 监听端口列表 ---${PLAIN}"
+  list_active_ports
   read -p "按回车返回..."
 }
 
@@ -323,13 +395,13 @@ menu_set_xray_limits(){
   if [[ "$sel" == "0" ]]; then return; fi
 
   read -p "输入速率(Mbps): " mbps
-  if ! [[ "$mbps" =~ ^[0-9]+$ ]]; then 
+  if ! [[ "$mbps" =~ ^[0-9]+$ ]]; then
       echo -e "${RED}无效数字${PLAIN}"
       read -p "按回车返回..."
       return
   fi
   init_all || { echo -e "${RED}Init failed${PLAIN}"; read -p "按回车返回..."; return; }
-  
+
   case "$sel" in
     1) apply_xray_out_limit "$mbps" ;;
     2) apply_xray_in_limit "$mbps" ;;
@@ -344,7 +416,7 @@ apply_port_limit_one(){
   local rate_kbit=$((mbps * 1000))
   local minor_hex; minor_hex="$(alloc_minor_for_port "$port")"
   [[ -z "$minor_hex" ]] && { echo -e "${RED}ClassID 耗尽${PLAIN}"; return 1; }
-  
+
   local classid="1:${minor_hex}"
   local handle_hex="$minor_hex"
 
@@ -384,11 +456,10 @@ apply_port_limit_one(){
 
 menu_port_limit(){
   echo -e "\n${BLUE}--- 特定端口限速 (支持序号点选) ---${PLAIN}"
-  
+
   declare -a p_port p_proto p_name
   local idx=0
   local raw_data
-  # 解析 ss: 协议, 本地地址, 进程. 按端口数字排序
   raw_data=$(ss -tunlp -H | awk '{
       proto=$1; addr=$5; proc=$7
       n=split(addr, a, ":"); port=a[n]
@@ -397,7 +468,6 @@ menu_port_limit(){
       print port, proto, name
   }' | sort -k1,1n | uniq)
 
-  # Header
   echo -e "----------------------------------------------------------------"
   printf "${GREEN}%-6s %-8s %-10s %-20s${PLAIN}\n" "序号" "协议" "端口" "进程"
   echo -e "----------------------------------------------------------------"
@@ -439,7 +509,7 @@ menu_port_limit(){
       return
   fi
 
-  if ! is_number "$target_port" || [[ "$target_port" -le 0 || "$target_port" -gt 65535 ]]; then 
+  if ! is_number "$target_port" || [[ "$target_port" -le 0 || "$target_port" -gt 65535 ]]; then
       echo -e "${RED}端口无效: $target_port${PLAIN}"
       read -p "按回车返回..."
       return
@@ -448,7 +518,7 @@ menu_port_limit(){
   echo -e "\n1) 仅限制 出站/下行\n2) 仅限制 入站/上行\n3) 限制 入站+出站"
   read -p "选择: " sel
   read -p "速率(Mbps): " mbps
-  
+
   if ! [[ "$mbps" =~ ^[0-9]+$ ]]; then
       echo -e "${RED}无效数字${PLAIN}"
       read -p "按回车返回..."
@@ -507,19 +577,19 @@ menu_remove_port_limit(){
   echo -e "--------------------------------------------------------"
   printf "${GREEN}%-6s %-10s %-12s %-10s${PLAIN}\n" "序号" "端口" "方向" "限速"
   echo -e "--------------------------------------------------------"
-  
+
   declare -a r_list_port
   local idx=0
-  
+
   while IFS='|' read -r type port dir mbps ts meta; do
     if [[ "$type" == "PORT" ]]; then
         idx=$((idx+1))
         r_list_port[$idx]="$port"
-        
+
         local d_str="未知"
         if [[ "$dir" == "out" ]]; then d_str="out(下行)"; fi
         if [[ "$dir" == "in" ]]; then d_str="in(上行)"; fi
-        
+
         printf "[%d]    %-10s %-12s %-10s\n" "$idx" "$port" "$d_str" "${mbps}Mbps"
     fi
   done < "$DB_FILE"
@@ -528,7 +598,7 @@ menu_remove_port_limit(){
   echo -e "${GREEN}[0]${PLAIN}    返回主菜单"
   echo -e "${GREEN}[输入]${PLAIN} 请输入序号 或 端口号:"
   read -p "选择: " input_val
-  
+
   if [[ "$input_val" == "0" ]]; then return; fi
 
   local target_port=""
@@ -539,12 +609,12 @@ menu_remove_port_limit(){
       target_port="$input_val"
   fi
 
-  if ! is_number "$target_port"; then 
+  if ! is_number "$target_port"; then
       echo -e "${RED}输入无效${PLAIN}"
       read -p "按回车返回..."
       return
   fi
-  
+
   echo -e "即将移除端口 ${GREEN}${target_port}${PLAIN} 的所有限速规则..."
   init_all >/dev/null 2>&1 || true
   remove_port_limit_exec "$target_port"
@@ -614,7 +684,11 @@ install_ookla_speedtest(){
     apt-get update >/dev/null 2>&1 && apt-get install -y speedtest >/dev/null 2>&1 && installed=1
   elif [ -f /etc/redhat-release ]; then
     curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.rpm.sh | bash >/dev/null 2>&1
-    yum install -y speedtest >/dev/null 2>&1 && installed=1
+    if command -v dnf >/dev/null 2>&1; then
+      dnf install -y speedtest >/dev/null 2>&1 && installed=1
+    else
+      yum install -y speedtest >/dev/null 2>&1 && installed=1
+    fi
   fi
   if [[ "$installed" -eq 0 ]]; then
     local arch; arch=$(uname -m)
@@ -634,32 +708,32 @@ install_ookla_speedtest(){
 
 run_ookla_speedtest(){
   if ! command -v speedtest >/dev/null 2>&1; then install_ookla_speedtest || { echo -e "${RED}安装失败${PLAIN}"; read -p "回车返回..."; return; }; fi
-  
+
   echo -e "\n${BLUE}========== Speedtest by Ookla (Global + Domestic) ==========${PLAIN}"
-  
+
   echo -e "${YELLOW}--- 中国国内 (China) ---${PLAIN}"
   printf "%-36s | %-36s\n" " 1) 3633  (电信|上海)" " 2) 27594 (电信|南京)"
   printf "%-36s | %-36s\n" " 3) 27377 (电信|合肥)" " 4) 24447 (联通|上海)"
   printf "%-36s | %-36s\n" " 5) 4870  (联通|长沙)" " 6) 16803 (移动|上海)"
   printf "%-36s | %-36s\n" " 7) 25858 (移动|北京)" " 8) 55299 (广电|南京)"
   printf "%-36s\n" " 9) 58529 (广电|北京)"
-  
+
   echo -e "\n${YELLOW}--- 亚洲 (Asia) ---${PLAIN}"
   printf "%-36s | %-36s\n" "10) 13538 (香港|STC)" "11) 1536  (香港|CSL)"
   printf "%-36s | %-36s\n" "12) 18445 (台湾|中华电信)" "13) 21569 (日本|IPA)"
   printf "%-36s | %-36s\n" "14) 48463 (日本|Rakuten)" "15) 26685 (韩国|Kdatacenter)"
   printf "%-36s\n" "16) 13623 (新加坡|Singtel)"
-  
+
   echo -e "\n${YELLOW}--- 欧美/其他 (Global Others) ---${PLAIN}"
   printf "%-36s | %-36s\n" "17) 17383 (美国|洛杉矶)" "18) 14236 (美国|圣何塞)"
   printf "%-36s | %-36s\n" "19) 5029  (美国|纽约)" "20) 30537 (加拿大|Rogers)"
   printf "%-36s | %-36s\n" "21) 35055 (英国|伦敦)" "22) 31120 (德国|法兰克福)"
   printf "%-36s | %-36s\n" "23) 1688  (法国|Bouygues)" "24) 5252  (荷兰|KPN)"
-  
+
   echo -e "------------------------------------------------------------------------"
   echo -e "0) 返回主菜单"
   read -p "请输入序号/ID (直接回车自动, 0返回): " selection
-  
+
   if [[ "$selection" == "0" ]]; then return; fi
 
   local sid=""
@@ -693,11 +767,11 @@ run_ookla_speedtest(){
   esac
 
   if [[ ! -f ~/.config/ookla/speedtest-cli.json ]]; then speedtest --accept-license --accept-gdpr >/dev/null 2>&1; fi
-  
+
   echo -e "${CYAN}正在连接测速服务器...${PLAIN}\n"
-  if [[ -n "$sid" ]]; then 
+  if [[ -n "$sid" ]]; then
       speedtest --server-id="$sid" --progress=yes
-  else 
+  else
       speedtest --progress=yes
   fi
   echo -e "${BLUE}========================================${PLAIN}"
