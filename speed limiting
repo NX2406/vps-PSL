@@ -196,7 +196,7 @@ install_psl_command(){
   fi
 
   # 非普通文件（管道/fd）或不可读时，从 GitHub 拉取。失败不影响当前菜单。
-  curl -fsSL "https://cdn.jsdelivr.net/gh/NX2406/vps-PSL@main/speed%20limiting" -o "$target" >/dev/null 2>&1 \
+  curl -fsSL "https://raw.githubusercontent.com/NX2406/vps-PSL/refs/heads/main/speed%20limiting" -o "$target" >/dev/null 2>&1 \
     && chmod +x "$target" >/dev/null 2>&1 \
     && ln -sf "$target" "$lower" >/dev/null 2>&1 || true
 }

@@ -16,7 +16,7 @@
 首次安装/运行：
 
 ```bash
-bash <(curl -sL https://cdn.jsdelivr.net/gh/NX2406/vps-PSL@main/speed%20limiting)
+bash <(curl -sL https://raw.githubusercontent.com/NX2406/vps-PSL/refs/heads/main/speed%20limiting)
 ```
 
 首次运行后，脚本会自动安装到：
