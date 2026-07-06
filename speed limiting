@@ -190,11 +190,12 @@ install_psl_command(){
   fi
 
   local src="${BASH_SOURCE[0]}"
-  if [[ -r "$src" ]]; then
+  # 只有普通文件才可靠复制；bash <(curl ...) 运行时 src 是管道/fd，已消费完 cp 会读到空。
+  if [[ -f "$src" && -r "$src" ]]; then
     cp -f "$src" "$target" >/dev/null 2>&1 && chmod +x "$target" >/dev/null 2>&1 && ln -sf "$target" "$lower" >/dev/null 2>&1 && return 0
   fi
 
-  # 极少数环境下 BASH_SOURCE 不可读时，从 GitHub 拉取安装。失败不影响当前菜单运行。
+  # 非普通文件（管道/fd）或不可读时，从 GitHub 拉取。失败不影响当前菜单。
   curl -fsSL "https://raw.githubusercontent.com/NX2406/vps-PSL/refs/heads/main/speed%20limiting" -o "$target" >/dev/null 2>&1 \
     && chmod +x "$target" >/dev/null 2>&1 \
     && ln -sf "$target" "$lower" >/dev/null 2>&1 || true
