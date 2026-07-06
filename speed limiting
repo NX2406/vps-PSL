@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==================================================
-# VPS 流量控制台 V10.22 (Zero-Latency Return)
+# VPS 流量控制台 V10.30 (Precision HTB)
 #
 # 功能全集：
 # 1) 监听端口 (列表)
@@ -14,9 +14,11 @@
 # 9) 实时流量监控
 # 10) 彻底卸载
 #
-# 修改记录 V10.22:
-# - [修复] 子菜单输入 0 后立即返回主菜单，不再需要二次回车
-# - [优化] 错误提示和操作成功提示的停留逻辑
+# 修改记录 V10.30:
+# - [新增] 首次运行自动安装 PSL/psl 命令，后续直接 PSL 调出菜单
+# - [新增] Mbps 支持一位小数，例如 10.5 / 0.5
+# - [优化] 限速策略改为 HTB + fq_codel，避免 HTB+TBF 双重限速导致速度明显偏低
+# - [优化] 根据目标速率动态计算 burst/cburst，并增加默认 5% 链路层补偿
 #
 # CentOS 7.9 修复点（不改变原功能/架构）：
 # - CentOS7 常无 nftables：为“Xray 出站标记”增加 iptables(mangle+owner) 兜底
@@ -67,7 +69,7 @@ ensure_deps(){
   [[ -z "$mgr" ]] && return 0
 
   # 追加 iptables（CentOS7 nftables 常缺，iptables 必须在）
-  local need_cmds=(ip tc ss awk sed grep cut tr uname date mkdir mv rm modprobe ps id curl head wc mktemp cat tar iptables)
+  local need_cmds=(ip tc ss awk sed grep cut tr uname date mkdir mv rm modprobe ps id curl head wc mktemp cat tar iptables cp chmod ln cmp)
 
   local missing=()
   for c in "${need_cmds[@]}"; do
@@ -92,27 +94,12 @@ ensure_deps(){
   echo -e "${GREEN}依赖已补齐（或已存在），继续执行...${PLAIN}\n"
 }
 
-# ----------------- 系统更新源（兼容 dnf/yum） -----------------
-echo -e "${YELLOW}正在检测系统类型并更新软件源...${PLAIN}"
-if [ -f /etc/debian_version ]; then
-  echo -e "${BLUE}检测到 Debian/Ubuntu 系统，执行 apt-get update...${PLAIN}"
-  apt-get update
-elif [ -f /etc/redhat-release ]; then
-  echo -e "${BLUE}检测到 CentOS/RedHat 系统，执行 makecache...${PLAIN}"
-  if command -v dnf >/dev/null 2>&1; then
-    dnf -y makecache
-  else
-    yum -y makecache
-  fi
-else
-  echo -e "${RED}未识别的操作系统，跳过自动更新。${PLAIN}"
-fi
-echo -e "${GREEN}系统软件源更新完成！${PLAIN}\n"
-
-# 先补依赖，再做强校验
+# ----------------- 依赖检查 -----------------
+# V10.30: PSL 日常打开菜单不再每次强制 apt update / makecache，避免启动慢、打断使用。
+# 只有发现缺失依赖时，ensure_deps 才会按需刷新源并安装。
 ensure_deps
 
-for cmd in ip tc ss awk sed grep cut tr uname date mkdir mv rm modprobe ps id curl head wc mktemp cat tar iptables; do
+for cmd in ip tc ss awk sed grep cut tr uname date mkdir mv rm modprobe ps id curl head wc mktemp cat tar iptables cp chmod ln cmp; do
   command -v "$cmd" >/dev/null 2>&1 || { echo -e "${RED}缺少命令: $cmd${PLAIN}"; exit 1; }
 done
 
@@ -135,9 +122,11 @@ IFB_DEV="ifb0"
 ROOT_RATE="10000mbit"
 ROOT_QUANTUM=200000
 USER_QUANTUM=15000
-HTB_BURST="1m"
-TBF_LATENCY_MS=50
-TBF_MIN_BURST_BYTES=32768
+# 应用层测速通常会扣除 TCP/IP/隧道头部开销，tc 按链路层控速。
+# 默认给 5% 补偿，让用户输入的 Mbps 更接近 speedtest/iperf 看到的实际值。
+RATE_COMPENSATION_PERCENT=5
+HTB_MIN_BURST_BYTES=65536
+HTB_MAX_BURST_BYTES=4194304
 
 DEFAULT_MINOR_HEX="fffe"
 DEFAULT_CLASSID="1:${DEFAULT_MINOR_HEX}"
@@ -157,6 +146,27 @@ touch "$DB_FILE" >/dev/null 2>&1 || true
 
 # ---------------- utils ----------------
 is_number(){ [[ "$1" =~ ^[0-9]+$ ]]; }
+is_rate_mbps(){ [[ "$1" =~ ^[0-9]+([.][0-9])?$ ]]; }
+normalize_mbps(){ awk -v v="$1" 'BEGIN{printf "%.1f", v+0}'; }
+# 用户输入 Mbps -> tc kbit。支持一位小数，并加入默认补偿。
+mbps_to_kbit(){ awk -v v="$1" -v c="$RATE_COMPENSATION_PERCENT" 'BEGIN{printf "%d", (v*1000*(100+c)/100)+0.5}'; }
+# 展示/入库仍使用用户输入值，不显示补偿后的内部 tc 值。
+rate_meta(){ local mbps="$1"; local kbit; kbit="$(mbps_to_kbit "$mbps")"; echo "target=${mbps}Mbps,effective=${kbit}kbit,comp=${RATE_COMPENSATION_PERCENT}%"; }
+calc_htb_burst(){
+  local rate_kbit="$1"
+  local burst=$(( rate_kbit * 25 / 2 ))  # 约 100ms 的 token，单位 bytes
+  [[ "$burst" -lt "$HTB_MIN_BURST_BYTES" ]] && burst="$HTB_MIN_BURST_BYTES"
+  [[ "$burst" -gt "$HTB_MAX_BURST_BYTES" ]] && burst="$HTB_MAX_BURST_BYTES"
+  echo "$burst"
+}
+calc_htb_quantum(){
+  local rate_kbit="$1"
+  # 与 ensure_htb_tree 的 r2q=10 匹配：quantum 约等于 rate / r2q，换算为 bytes。
+  local q=$(( rate_kbit * 1000 / 8 / 10 ))
+  [[ "$q" -lt 1514 ]] && q=1514
+  [[ "$q" -gt "$USER_QUANTUM" ]] && q="$USER_QUANTUM"
+  echo "$q"
+}
 try_modprobe(){ modprobe "$1" >/dev/null 2>&1 || true; }
 
 run_or_fail(){
@@ -168,6 +178,26 @@ run_or_fail(){
     return 1
   }
   return 0
+}
+
+# ---------------- self install ----------------
+install_psl_command(){
+  local target="/usr/local/bin/PSL"
+  local lower="/usr/local/bin/psl"
+  if [[ -x "$target" ]] && cmp -s "${BASH_SOURCE[0]}" "$target" 2>/dev/null; then
+    [[ -e "$lower" ]] || ln -sf "$target" "$lower" >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  local src="${BASH_SOURCE[0]}"
+  if [[ -r "$src" ]]; then
+    cp -f "$src" "$target" >/dev/null 2>&1 && chmod +x "$target" >/dev/null 2>&1 && ln -sf "$target" "$lower" >/dev/null 2>&1 && return 0
+  fi
+
+  # 极少数环境下 BASH_SOURCE 不可读时，从 GitHub 拉取安装。失败不影响当前菜单运行。
+  curl -fsSL "https://raw.githubusercontent.com/NX2406/vps-PSL/refs/heads/main/speed%20limiting" -o "$target" >/dev/null 2>&1 \
+    && chmod +x "$target" >/dev/null 2>&1 \
+    && ln -sf "$target" "$lower" >/dev/null 2>&1 || true
 }
 
 # DB Ops
@@ -238,6 +268,8 @@ ensure_ingress_redirect(){
 
 ensure_htb_tree(){
   local dev="$1"
+  # IFB 设备可能被 reset_all 删除；这里自恢复，避免后续顺序调整时踩坑。
+  [[ "$dev" == "$IFB_DEV" ]] && ensure_ifb
   if ! tc qdisc show dev "$dev" 2>/dev/null | grep -q "htb 1:"; then
     run_or_fail "Root HTB on $dev" tc qdisc add dev "$dev" root handle 1: htb default "$DEFAULT_MINOR_HEX" r2q 10 || return 1
   else
@@ -267,21 +299,16 @@ init_all(){
 
 attach_precise_leaf(){
   local dev="$1" classid="$2" handle_major_hex="$3" rate_kbit="$4"
-  local burst_bytes=$(( rate_kbit * 25 / 10 ))
-  [[ "$burst_bytes" -lt "$TBF_MIN_BURST_BYTES" ]] && burst_bytes="$TBF_MIN_BURST_BYTES"
-  local latency="${TBF_LATENCY_MS}ms"
-  local tbf_handle="${handle_major_hex}:"
-  local inner_parent="${handle_major_hex}:1"
-
+  # V10.30: 不再叠加 TBF，避免 HTB+TBF 双 token bucket 把速度压得远低于目标。
+  # HTB 负责限速；fq_codel 负责公平排队和延迟控制。
   tc qdisc del dev "$dev" parent "$classid" >/dev/null 2>&1 || true
-  run_or_fail "Leaf TBF on $dev/$classid" tc qdisc add dev "$dev" parent "$classid" handle "$tbf_handle" tbf \
-    rate "${rate_kbit}kbit" burst "${burst_bytes}" latency "$latency" || return 1
-  tc qdisc replace dev "$dev" parent "$inner_parent" handle "${handle_major_hex}f:" fq_codel >/dev/null 2>&1 || true
+  tc qdisc replace dev "$dev" parent "$classid" handle "${handle_major_hex}:" fq_codel quantum 1514 target 5ms interval 100ms ecn >/dev/null 2>&1 || \
+    tc qdisc replace dev "$dev" parent "$classid" handle "${handle_major_hex}:" fq_codel >/dev/null 2>&1 || return 1
   return 0
 }
 
 # ----------------- Allocation -----------------
-minor_in_use(){ grep -E "minor=$1\s*$" "$DB_FILE" >/dev/null 2>&1; }
+minor_in_use(){ grep -E "minor=$1([^0-9a-f]|$)" "$DB_FILE" >/dev/null 2>&1; }
 alloc_minor_for_port(){
   local port="$1"
   local start=$((1000 + (port % 50000)))
@@ -369,18 +396,19 @@ apply_xray_out_limit(){
   fi
   ensure_nft_mark_rule "$uid" || return 1
 
-  local rate_kbit=$((mbps * 1000))
+  local rate_kbit; rate_kbit="$(mbps_to_kbit "$mbps")"
   local handle_hex="0200"
 
   tc filter del dev "$INTERFACE" parent 1:0 protocol all prio 10 >/dev/null 2>&1 || true
   tc qdisc  del dev "$INTERFACE" parent "$XRAY_OUT_CLASSID" >/dev/null 2>&1 || true
   tc class  del dev "$INTERFACE" parent 1:1 classid "$XRAY_OUT_CLASSID" >/dev/null 2>&1 || true
 
-  run_or_fail "Class create" tc class add dev "$INTERFACE" parent 1:1 classid "$XRAY_OUT_CLASSID" htb rate "${rate_kbit}kbit" ceil "${rate_kbit}kbit" burst "$HTB_BURST" quantum "$USER_QUANTUM" || return 1
+  local burst quantum; burst="$(calc_htb_burst "$rate_kbit")"; quantum="$(calc_htb_quantum "$rate_kbit")"
+  run_or_fail "Class create" tc class add dev "$INTERFACE" parent 1:1 classid "$XRAY_OUT_CLASSID" htb rate "${rate_kbit}kbit" ceil "${rate_kbit}kbit" burst "$burst" cburst "$burst" quantum "$quantum" || return 1
   attach_precise_leaf "$INTERFACE" "$XRAY_OUT_CLASSID" "$handle_hex" "$rate_kbit" || return 1
   run_or_fail "Filter add" tc filter add dev "$INTERFACE" parent 1:0 protocol all prio 10 handle "$XRAY_MARK_DEC" fw flowid "$XRAY_OUT_CLASSID" || return 1
 
-  db_upsert "XRAY" "OUT" "out" "$mbps" "class=200,uid=$uid"
+  db_upsert "XRAY" "OUT" "out" "$mbps" "class=200,uid=$uid,$(rate_meta "$mbps")"
   echo -e "${GREEN}[Success]${PLAIN} Xray(UID:$uid) 总出站限制：${mbps} Mbps"
 }
 
@@ -398,13 +426,14 @@ apply_xray_in_limit(){
   local ports; ports="$(get_xray_listen_ports)"
   [[ -z "$ports" ]] && { echo -e "${RED}[FAIL]${PLAIN} 未检测到 xray 监听端口"; return 1; }
 
-  local rate_kbit=$((mbps * 1000))
+  local rate_kbit; rate_kbit="$(mbps_to_kbit "$mbps")"
   local handle_hex="0201"
 
   tc qdisc del dev "$IFB_DEV" parent "$XRAY_IN_CLASSID" >/dev/null 2>&1 || true
   tc class del dev "$IFB_DEV" parent 1:1 classid "$XRAY_IN_CLASSID" >/dev/null 2>&1 || true
 
-  run_or_fail "Class create" tc class add dev "$IFB_DEV" parent 1:1 classid "$XRAY_IN_CLASSID" htb rate "${rate_kbit}kbit" ceil "${rate_kbit}kbit" burst "$HTB_BURST" quantum "$USER_QUANTUM" || return 1
+  local burst quantum; burst="$(calc_htb_burst "$rate_kbit")"; quantum="$(calc_htb_quantum "$rate_kbit")"
+  run_or_fail "Class create" tc class add dev "$IFB_DEV" parent 1:1 classid "$XRAY_IN_CLASSID" htb rate "${rate_kbit}kbit" ceil "${rate_kbit}kbit" burst "$burst" cburst "$burst" quantum "$quantum" || return 1
   attach_precise_leaf "$IFB_DEV" "$XRAY_IN_CLASSID" "$handle_hex" "$rate_kbit" || return 1
 
   while read -r p; do
@@ -418,7 +447,7 @@ apply_xray_in_limit(){
     fi
   done <<< "$ports"
 
-  db_upsert "XRAY" "IN" "in" "$mbps" "class=201"
+  db_upsert "XRAY" "IN" "in" "$mbps" "class=201,$(rate_meta "$mbps")"
   echo -e "${GREEN}[Success]${PLAIN} Xray 总入站限制：${mbps} Mbps"
 }
 
@@ -430,11 +459,12 @@ menu_set_xray_limits(){
   if [[ "$sel" == "0" ]]; then return; fi
 
   read -p "输入速率(Mbps): " mbps
-  if ! [[ "$mbps" =~ ^[0-9]+$ ]]; then
-      echo -e "${RED}无效数字${PLAIN}"
+  if ! is_rate_mbps "$mbps"; then
+      echo -e "${RED}无效数字，请输入最多一位小数的 Mbps，例如 10 或 10.5${PLAIN}"
       read -p "按回车返回..."
       return
   fi
+  mbps="$(normalize_mbps "$mbps")"
   init_all || { echo -e "${RED}Init failed${PLAIN}"; read -p "按回车返回..."; return; }
 
   case "$sel" in
@@ -448,7 +478,7 @@ menu_set_xray_limits(){
 # ----------------- 3) Port Limits (Select Menu) -----------------
 apply_port_limit_one(){
   local port="$1" dir="$2" mbps="$3"
-  local rate_kbit=$((mbps * 1000))
+  local rate_kbit; rate_kbit="$(mbps_to_kbit "$mbps")"
   local minor_hex; minor_hex="$(alloc_minor_for_port "$port")"
   [[ -z "$minor_hex" ]] && { echo -e "${RED}ClassID 耗尽${PLAIN}"; return 1; }
 
@@ -459,7 +489,8 @@ apply_port_limit_one(){
     tc filter del dev "$INTERFACE" parent 1:0 protocol ip prio "$port" >/dev/null 2>&1 || true
     tc filter del dev "$INTERFACE" parent 1:0 protocol ipv6 prio "$port" >/dev/null 2>&1 || true
     tc class del dev "$INTERFACE" parent 1:1 classid "$classid" >/dev/null 2>&1 || true
-    run_or_fail "Class create" tc class add dev "$INTERFACE" parent 1:1 classid "$classid" htb rate "${rate_kbit}kbit" ceil "${rate_kbit}kbit" burst "$HTB_BURST" quantum "$USER_QUANTUM" || return 1
+    local burst quantum; burst="$(calc_htb_burst "$rate_kbit")"; quantum="$(calc_htb_quantum "$rate_kbit")"
+    run_or_fail "Class create" tc class add dev "$INTERFACE" parent 1:1 classid "$classid" htb rate "${rate_kbit}kbit" ceil "${rate_kbit}kbit" burst "$burst" cburst "$burst" quantum "$quantum" || return 1
     attach_precise_leaf "$INTERFACE" "$classid" "$handle_hex" "$rate_kbit" || return 1
     run_or_fail "Filter IPv4" tc filter add dev "$INTERFACE" parent 1:0 protocol ip prio "$port" u32 match ip protocol 6 0xff match ip sport "$port" 0xffff flowid "$classid" || return 1
     tc filter add dev "$INTERFACE" parent 1:0 protocol ip prio "$port" u32 match ip protocol 17 0xff match ip sport "$port" 0xffff flowid "$classid" >/dev/null 2>&1 || true
@@ -467,7 +498,7 @@ apply_port_limit_one(){
       tc filter add dev "$INTERFACE" parent 1:0 protocol ipv6 prio "$port" flower ip_proto tcp src_port "$port" flowid "$classid" >/dev/null 2>&1 || true
       tc filter add dev "$INTERFACE" parent 1:0 protocol ipv6 prio "$port" flower ip_proto udp src_port "$port" flowid "$classid" >/dev/null 2>&1 || true
     fi
-    db_upsert "PORT" "$port" "out" "$mbps" "minor=${minor_hex}"
+    db_upsert "PORT" "$port" "out" "$mbps" "minor=${minor_hex},$(rate_meta "$mbps")"
     echo -e "${GREEN}[Success]${PLAIN} 端口 ${port} 出站限制：${mbps} Mbps"
     return 0
   fi
@@ -476,14 +507,15 @@ apply_port_limit_one(){
     tc filter del dev "$IFB_DEV" parent 1:0 protocol ip prio "$port" >/dev/null 2>&1 || true
     tc filter del dev "$IFB_DEV" parent 1:0 protocol ipv6 prio "$port" >/dev/null 2>&1 || true
     tc class del dev "$IFB_DEV" parent 1:1 classid "$classid" >/dev/null 2>&1 || true
-    run_or_fail "Class create" tc class add dev "$IFB_DEV" parent 1:1 classid "$classid" htb rate "${rate_kbit}kbit" ceil "${rate_kbit}kbit" burst "$HTB_BURST" quantum "$USER_QUANTUM" || return 1
+    local burst quantum; burst="$(calc_htb_burst "$rate_kbit")"; quantum="$(calc_htb_quantum "$rate_kbit")"
+    run_or_fail "Class create" tc class add dev "$IFB_DEV" parent 1:1 classid "$classid" htb rate "${rate_kbit}kbit" ceil "${rate_kbit}kbit" burst "$burst" cburst "$burst" quantum "$quantum" || return 1
     attach_precise_leaf "$IFB_DEV" "$classid" "$handle_hex" "$rate_kbit" || return 1
     run_or_fail "Filter IPv4" tc filter add dev "$IFB_DEV" parent 1:0 protocol ip prio "$port" u32 match ip dport "$port" 0xffff flowid "$classid" || return 1
     if has_flower; then
       tc filter add dev "$IFB_DEV" parent 1:0 protocol ipv6 prio "$port" flower ip_proto tcp dst_port "$port" flowid "$classid" >/dev/null 2>&1 || true
       tc filter add dev "$IFB_DEV" parent 1:0 protocol ipv6 prio "$port" flower ip_proto udp dst_port "$port" flowid "$classid" >/dev/null 2>&1 || true
     fi
-    db_upsert "PORT" "$port" "in" "$mbps" "minor=${minor_hex}"
+    db_upsert "PORT" "$port" "in" "$mbps" "minor=${minor_hex},$(rate_meta "$mbps")"
     echo -e "${GREEN}[Success]${PLAIN} 端口 ${port} 入站限制：${mbps} Mbps"
     return 0
   fi
@@ -554,12 +586,13 @@ menu_port_limit(){
   read -p "选择: " sel
   read -p "速率(Mbps): " mbps
 
-  if ! [[ "$mbps" =~ ^[0-9]+$ ]]; then
-      echo -e "${RED}无效数字${PLAIN}"
+  if ! is_rate_mbps "$mbps"; then
+      echo -e "${RED}无效数字，请输入最多一位小数的 Mbps，例如 10 或 10.5${PLAIN}"
       read -p "按回车返回..."
       return
   fi
 
+  mbps="$(normalize_mbps "$mbps")"
   init_all || { echo -e "${RED}Init failed${PLAIN}"; read -p "按回车返回..."; return; }
   case "$sel" in
     1) apply_port_limit_one "$target_port" "out" "$mbps" ;;
@@ -936,14 +969,15 @@ do_uninstall(){
   [[ "$confirm" != "y" ]] && return
   reset_all
   rm -rf "$STATE_DIR"
-  echo -e "${GREEN}卸载完成。${PLAIN}"; echo -e "你可以手动删除此脚本: rm $0"; exit 0
+  rm -f /usr/local/bin/PSL /usr/local/bin/psl >/dev/null 2>&1 || true
+  echo -e "${GREEN}卸载完成。${PLAIN}"; exit 0
 }
 
 # ----------------- Menu -----------------
 show_menu(){
   clear
   echo -e "=================================================="
-  echo -e "   VPS 流量控制台 V10.22 (Zero-Latency Return)"
+  echo -e "   VPS 流量控制台 V10.30 (Precision HTB)"
   echo -e "   网卡: ${GREEN}${INTERFACE}${PLAIN} | IFB: ${GREEN}${IFB_DEV}${PLAIN}"
   echo -e "   nftables: $(mark_status)"
   echo -e "=================================================="
@@ -979,4 +1013,5 @@ show_menu(){
   show_menu
 }
 
+install_psl_command >/dev/null 2>&1 || true
 show_menu
