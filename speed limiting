@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==================================================
-# VPS 流量控制台 V10.30 (Precision HTB)
+# VPS 流量控制台 V10.31 (Precision HTB)
 #
 # 功能全集：
 # 1) 监听端口 (列表)
@@ -13,6 +13,17 @@
 # 8) Speedtest (国内+广电+国际)
 # 9) 实时流量监控
 # 10) 彻底卸载
+#
+# 修改记录 V10.31:
+# - [修复] Debian/Ubuntu 装依赖时用了不存在的包名 iproute2-tc，整条安装失败，最小化系统缺 modprobe/ps/iptables 直接退出
+# - [修复] RHEL 8+/Fedora 的 tc 在单独的 iproute-tc 包里，原来没有装，缺 tc 直接退出
+# - [优化] 依赖改为缺哪个命令装哪个包：一个包装不上（如精简镜像的 coreutils-single 冲突）不再连累全部；cmp 补上 diffutils
+# - [修复] 重启后限速全部失效、清单却还在：新增开机自动恢复（psl-restore 服务），也可手动执行 PSL restore
+# - [修复] 默认路由没有网关（on-link）时主网卡被识别成 IP 地址；纯 IPv6 机器识别不到主网卡
+# - [修复] CentOS 7 的 ss 不支持 -H，端口列表为空
+# - [修复] 网卡上已有显式 root 队列（如 fq/cake）时创建 HTB 失败
+# - [优化] 同一端口同一方向再次限速时沿用原来的 class，不再残留旧规则；速率不能为 0
+# - [优化] 菜单改为循环，不再每做一次操作递归一层；读输入统一用 read -r
 #
 # 修改记录 V10.30:
 # - [新增] 首次运行自动安装 PSL/psl 命令，后续直接 PSL 调出菜单
@@ -47,6 +58,22 @@ detect_pkg_mgr(){
   echo ""
 }
 
+# 命令 -> 包名
+pkg_for_cmd(){
+  local mgr="$1" c="$2"
+  case "$c" in
+    ip|ss) case "$mgr" in apt) echo iproute2 ;; *) echo iproute ;; esac ;;
+    # EL8+/Fedora 的 tc 单独在 iproute-tc 包里；CentOS 7 的 tc 仍在 iproute 里；Debian/Ubuntu 在 iproute2 里
+    tc) case "$mgr" in apt) echo iproute2 ;; dnf) echo iproute-tc ;; *) echo iproute ;; esac ;;
+    modprobe) echo kmod ;;
+    ps) case "$mgr" in apt) echo procps ;; *) echo procps-ng ;; esac ;;
+    awk) echo gawk ;;
+    cmp) echo diffutils ;;
+    curl|tar|iptables|grep|sed) echo "$c" ;;
+    *) echo coreutils ;;
+  esac
+}
+
 install_pkgs(){
   local mgr="$1"; shift
   local pkgs=("$@")
@@ -79,13 +106,15 @@ ensure_deps(){
 
   echo -e "${YELLOW}检测到缺失依赖：${missing[*]}，尝试自动安装...${PLAIN}"
 
-  if [[ "$mgr" == "dnf" || "$mgr" == "yum" ]]; then
-    local pkgs=(iproute tar curl kmod procps-ng coreutils gawk grep sed util-linux iptables)
-    pkgs+=(nftables) # 能装就装，装不了也不影响（有 iptables 兜底）
-    install_pkgs "$mgr" "${pkgs[@]}" >/dev/null 2>&1 || true
-  else
-    install_pkgs "$mgr" iproute2 iproute2-tc tar curl kmod procps gawk grep sed coreutils util-linux iptables nftables >/dev/null 2>&1 || true
-  fi
+  # 缺哪个命令装哪个包：整表安装时只要有一个包装不上（包名不存在、和 coreutils-single 冲突等），apt/dnf 会整条失败
+  local pkgs=() p
+  for c in "${missing[@]}"; do
+    p="$(pkg_for_cmd "$mgr" "$c")"
+    [[ " ${pkgs[*]} " == *" $p "* ]] || pkgs+=("$p")
+  done
+  # nftables 只用于 Xray 出站标记，顺带装上（没有也能用 iptables 兜底）
+  command -v nft >/dev/null 2>&1 || pkgs+=(nftables)
+  install_pkgs "$mgr" "${pkgs[@]}" >/dev/null 2>&1 || true
 
   for c in "${missing[@]}"; do
     command -v "$c" >/dev/null 2>&1 || { echo -e "${RED}缺少命令: $c${PLAIN}"; exit 1; }
@@ -114,8 +143,17 @@ mark_status(){
   echo -e "${YELLOW}缺失${PLAIN}"
 }
 
-INTERFACE="$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')"
-[[ -z "$INTERFACE" ]] && echo -e "${RED}错误：无法识别主网卡（ip route get 8.8.8.8 失败）${PLAIN}" && exit 1
+# 取 dev 后面的网卡名：默认路由没有网关（on-link）时第 5 列是源地址；纯 IPv6 机器改查 IPv6 路由
+detect_iface(){
+  { ip -4 route get 8.8.8.8 2>/dev/null || ip -6 route get 2001:4860:4860::8888 2>/dev/null; } | \
+    awk '{for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit }}'
+}
+INTERFACE="$(detect_iface)"
+# 开机恢复时网络可能还没就绪，最多等 60 秒
+if [[ -z "$INTERFACE" && "${1:-}" == "restore" ]]; then
+  for _ in $(seq 1 30); do sleep 2; INTERFACE="$(detect_iface)"; [[ -n "$INTERFACE" ]] && break; done
+fi
+[[ -z "$INTERFACE" ]] && echo -e "${RED}错误：无法识别主网卡（IPv4 和 IPv6 路由都查不到）${PLAIN}" && exit 1
 IFB_DEV="ifb0"
 
 # TC Params
@@ -146,7 +184,7 @@ touch "$DB_FILE" >/dev/null 2>&1 || true
 
 # ---------------- utils ----------------
 is_number(){ [[ "$1" =~ ^[0-9]+$ ]]; }
-is_rate_mbps(){ [[ "$1" =~ ^[0-9]+([.][0-9])?$ ]]; }
+is_rate_mbps(){ [[ "$1" =~ ^[0-9]+([.][0-9])?$ ]] && awk -v v="$1" 'BEGIN{exit !(v + 0 > 0)}'; }
 normalize_mbps(){ awk -v v="$1" 'BEGIN{printf "%.1f", v+0}'; }
 # 用户输入 Mbps -> tc kbit。支持一位小数，并加入默认补偿。
 mbps_to_kbit(){ awk -v v="$1" -v c="$RATE_COMPENSATION_PERCENT" 'BEGIN{printf "%d", (v*1000*(100+c)/100)+0.5}'; }
@@ -215,6 +253,50 @@ db_delete_prefix(){
   mv -f "${DB_FILE}.tmp" "$DB_FILE" >/dev/null 2>&1 || true
 }
 
+# ---------------- 开机恢复 ----------------
+# tc 规则和 IFB 网卡重启后都会消失，限速记录却还留在 DB 里：开机后按记录重新下发
+RESTORE_UNIT="/etc/systemd/system/psl-restore.service"
+RESTORE_CRON="@reboot sleep 20; /usr/local/bin/PSL restore >/dev/null 2>&1"
+
+ensure_restore_service(){
+  [[ -x /usr/local/bin/PSL ]] || return 0
+  if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+    if [[ ! -f "$RESTORE_UNIT" ]]; then
+      cat > "$RESTORE_UNIT" <<'EOF'
+[Unit]
+Description=PSL: restore port speed limits after boot
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/PSL restore
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+      systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    systemctl is-enabled -q psl-restore.service 2>/dev/null || systemctl enable psl-restore.service >/dev/null 2>&1 || true
+  elif command -v crontab >/dev/null 2>&1; then
+    crontab -l 2>/dev/null | grep -qF "PSL restore" || { crontab -l 2>/dev/null; echo "$RESTORE_CRON"; } | crontab - >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+remove_restore_service(){
+  if [[ -f "$RESTORE_UNIT" ]]; then
+    systemctl disable psl-restore.service >/dev/null 2>&1 || true
+    rm -f "$RESTORE_UNIT"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+  if command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -qF "PSL restore"; then
+    crontab -l 2>/dev/null | grep -vF "PSL restore" | crontab - >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
 # ---------------- iptables cleanup for XRAY mark ----------------
 iptables_cleanup_xray_mark(){
   has_iptables || return 0
@@ -272,7 +354,8 @@ ensure_htb_tree(){
   # IFB 设备可能被 reset_all 删除；这里自恢复，避免后续顺序调整时踩坑。
   [[ "$dev" == "$IFB_DEV" ]] && ensure_ifb
   if ! tc qdisc show dev "$dev" 2>/dev/null | grep -q "htb 1:"; then
-    run_or_fail "Root HTB on $dev" tc qdisc add dev "$dev" root handle 1: htb default "$DEFAULT_MINOR_HEX" r2q 10 || return 1
+    # 用 replace：网卡上已有显式 root 队列（fq/cake 等）时 add 会报 Exclusivity flag on
+    run_or_fail "Root HTB on $dev" tc qdisc replace dev "$dev" root handle 1: htb default "$DEFAULT_MINOR_HEX" r2q 10 || return 1
   else
     tc qdisc replace dev "$dev" root handle 1: htb default "$DEFAULT_MINOR_HEX" r2q 10 >/dev/null 2>&1 || true
   fi
@@ -339,14 +422,14 @@ list_active_ports(){
     local pname; pname="$(echo "$process" | awk -F'"' '{print $2}')"
     [[ -z "$pname" ]] && pname="-"
     printf "${color}%-6s${PLAIN} %-8s %-20s\n" "$tag" "$port" "$pname"
-  done < <(ss -H -tunlp 2>/dev/null | awk '{print $1, $2, $5, $6, $7}' | sort -k3 -t' ' -n)
+  done < <(ss -tunlp 2>/dev/null | awk 'NR > 1 {print $1, $2, $5, $6, $7}' | sort -k3 -t' ' -n)
   echo -e "------------------------------------------------"
 }
 menu_list_ports(){
   clear
   echo -e "${BLUE}--- 监听端口列表 ---${PLAIN}"
   list_active_ports
-  read -p "按回车返回..."
+  read -r -p "按回车返回..."
 }
 
 # ----------------- 2) Xray Limits -----------------
@@ -389,10 +472,12 @@ ensure_nft_mark_rule(){
 
 apply_xray_out_limit(){
   local mbps="$1"
-  local uid; uid="$(detect_xray_uid_auto)"
+  # 第二个参数是开机恢复时传入的已记录 UID，有它就不再检测和询问
+  local uid="${2:-}"
+  [[ -n "$uid" ]] || uid="$(detect_xray_uid_auto)"
   if [[ -z "$uid" ]]; then
     echo -e "${YELLOW}警告：未能自动检测到 Xray 进程 UID。${PLAIN}"
-    read -p "手动输入 UID (0取消): " input_uid
+    read -r -p "手动输入 UID (0取消): " input_uid
     if [[ -n "$input_uid" && "$input_uid" != "0" ]]; then uid="$input_uid"; else return 1; fi
   fi
   ensure_nft_mark_rule "$uid" || return 1
@@ -414,7 +499,7 @@ apply_xray_out_limit(){
 }
 
 get_xray_listen_ports(){
-  ss -H -tunlp 2>/dev/null | awk '$0 ~ /xray/ {print $1, $2, $5}' | while read -r proto state addr; do
+  ss -tunlp 2>/dev/null | awk 'NR > 1 && $0 ~ /xray/ {print $1, $2, $5}' | while read -r proto state addr; do
     if [[ "$proto" == "tcp" && "$state" != "LISTEN" ]]; then continue; fi
     if [[ "$proto" == "udp" && "$state" != "UNCONN" ]]; then continue; fi
     port="$(echo "$addr" | awk -F':' '{print $NF}')"
@@ -456,31 +541,35 @@ menu_set_xray_limits(){
   echo -e "\n${BLUE}--- 限制 Xray 速度 ---${PLAIN}"
   echo -e "1) 仅限制 出站\n2) 仅限制 入站\n3) 限制 入站+出站"
   echo -e "0) 返回主菜单"
-  read -p "选择: " sel
+  read -r -p "选择: " sel
   if [[ "$sel" == "0" ]]; then return; fi
 
-  read -p "输入速率(Mbps): " mbps
+  read -r -p "输入速率(Mbps): " mbps
   if ! is_rate_mbps "$mbps"; then
       echo -e "${RED}无效数字，请输入最多一位小数的 Mbps，例如 10 或 10.5${PLAIN}"
-      read -p "按回车返回..."
+      read -r -p "按回车返回..."
       return
   fi
   mbps="$(normalize_mbps "$mbps")"
-  init_all || { echo -e "${RED}Init failed${PLAIN}"; read -p "按回车返回..."; return; }
+  init_all || { echo -e "${RED}Init failed${PLAIN}"; read -r -p "按回车返回..."; return; }
 
   case "$sel" in
     1) apply_xray_out_limit "$mbps" ;;
     2) apply_xray_in_limit "$mbps" ;;
     3) apply_xray_out_limit "$mbps" && apply_xray_in_limit "$mbps" ;;
   esac
-  read -p "操作完成，按回车返回..."
+  [[ -s "$DB_FILE" ]] && ensure_restore_service
+  read -r -p "操作完成，按回车返回..."
 }
 
 # ----------------- 3) Port Limits (Select Menu) -----------------
 apply_port_limit_one(){
   local port="$1" dir="$2" mbps="$3"
   local rate_kbit; rate_kbit="$(mbps_to_kbit "$mbps")"
-  local minor_hex; minor_hex="$(alloc_minor_for_port "$port")"
+  # 同一端口同一方向再次限速（以及开机恢复）沿用原来的 class，避免旧 class 残留
+  local minor_hex
+  minor_hex="$(grep -E "^PORT\|${port}\|${dir}\|" "$DB_FILE" 2>/dev/null | grep -o 'minor=[0-9a-f]*' | head -n 1 | cut -d= -f2)"
+  [[ -n "$minor_hex" ]] || minor_hex="$(alloc_minor_for_port "$port")"
   [[ -z "$minor_hex" ]] && { echo -e "${RED}ClassID 耗尽${PLAIN}"; return 1; }
 
   local classid="1:${minor_hex}"
@@ -525,10 +614,10 @@ apply_port_limit_one(){
 menu_port_limit(){
   echo -e "\n${BLUE}--- 特定端口限速 (支持序号点选) ---${PLAIN}"
 
-  declare -a p_port p_proto p_name
+  declare -a p_port p_name
   local idx=0
   local raw_data
-  raw_data=$(ss -tunlp -H | awk '{
+  raw_data=$(ss -tunlp 2>/dev/null | awk 'NR > 1 {
       proto=$1; addr=$5; proc=$7
       n=split(addr, a, ":"); port=a[n]
       split(proc, p, "\""); name=p[2]
@@ -546,7 +635,6 @@ menu_port_limit(){
       while read -r port proto name; do
           idx=$((idx+1))
           p_port[$idx]="$port"
-          p_proto[$idx]="$proto"
           p_name[$idx]="$name"
           local color="$PLAIN"
           [[ "$proto" == "tcp" ]] && color="$GREEN"
@@ -560,47 +648,48 @@ menu_port_limit(){
   echo -e "${GREEN}[m]${PLAIN}    手动输入端口号"
   echo -e "----------------------------------------------------------------"
 
-  read -p "请输入序号/m/0 : " sel
+  read -r -p "请输入序号/m/0 : " sel
   local target_port=""
 
   if [[ "$sel" == "0" ]]; then
       return
   elif [[ "$sel" == "m" ]]; then
-      read -p "请输入端口号: " input_p
+      read -r -p "请输入端口号: " input_p
       target_port="$input_p"
   elif [[ "$sel" =~ ^[0-9]+$ ]] && [[ "$sel" -le "$idx" ]] && [[ "$sel" -gt 0 ]]; then
       target_port="${p_port[$sel]}"
       echo -e "已选择: 端口 ${GREEN}${target_port}${PLAIN} (${p_name[$sel]})"
   else
       echo -e "${RED}输入无效${PLAIN}"
-      read -p "按回车返回..."
+      read -r -p "按回车返回..."
       return
   fi
 
   if ! is_number "$target_port" || [[ "$target_port" -le 0 || "$target_port" -gt 65535 ]]; then
       echo -e "${RED}端口无效: $target_port${PLAIN}"
-      read -p "按回车返回..."
+      read -r -p "按回车返回..."
       return
   fi
 
   echo -e "\n1) 仅限制 出站/下行\n2) 仅限制 入站/上行\n3) 限制 入站+出站"
-  read -p "选择: " sel
-  read -p "速率(Mbps): " mbps
+  read -r -p "选择: " sel
+  read -r -p "速率(Mbps): " mbps
 
   if ! is_rate_mbps "$mbps"; then
       echo -e "${RED}无效数字，请输入最多一位小数的 Mbps，例如 10 或 10.5${PLAIN}"
-      read -p "按回车返回..."
+      read -r -p "按回车返回..."
       return
   fi
 
   mbps="$(normalize_mbps "$mbps")"
-  init_all || { echo -e "${RED}Init failed${PLAIN}"; read -p "按回车返回..."; return; }
+  init_all || { echo -e "${RED}Init failed${PLAIN}"; read -r -p "按回车返回..."; return; }
   case "$sel" in
     1) apply_port_limit_one "$target_port" "out" "$mbps" ;;
     2) apply_port_limit_one "$target_port" "in"  "$mbps" ;;
     3) apply_port_limit_one "$target_port" "out" "$mbps" && apply_port_limit_one "$target_port" "in" "$mbps" ;;
   esac
-  read -p "操作完成，按回车返回..."
+  [[ -s "$DB_FILE" ]] && ensure_restore_service
+  read -r -p "操作完成，按回车返回..."
 }
 
 # ----------------- 4) Port Limits (Remove) -----------------
@@ -639,7 +728,7 @@ menu_remove_port_limit(){
   echo -e "\n${BLUE}--- 移除 特定端口 限速 (支持序号点选) ---${PLAIN}"
   if [[ ! -s "$DB_FILE" ]] || ! grep -q "^PORT|" "$DB_FILE"; then
       echo -e "${YELLOW}(当前无端口限速记录)${PLAIN}"
-      read -p "按回车返回..."
+      read -r -p "按回车返回..."
       return
   fi
 
@@ -666,7 +755,7 @@ menu_remove_port_limit(){
 
   echo -e "${GREEN}[0]${PLAIN}    返回主菜单"
   echo -e "${GREEN}[输入]${PLAIN} 请输入序号 或 端口号:"
-  read -p "选择: " input_val
+  read -r -p "选择: " input_val
 
   if [[ "$input_val" == "0" ]]; then return; fi
 
@@ -680,14 +769,14 @@ menu_remove_port_limit(){
 
   if ! is_number "$target_port"; then
       echo -e "${RED}输入无效${PLAIN}"
-      read -p "按回车返回..."
+      read -r -p "按回车返回..."
       return
   fi
 
   echo -e "即将移除端口 ${GREEN}${target_port}${PLAIN} 的所有限速规则..."
   init_all >/dev/null 2>&1 || true
   remove_port_limit_exec "$target_port"
-  read -p "操作完成，按回车返回..."
+  read -r -p "操作完成，按回车返回..."
 }
 
 # ----------------- 5) Show List -----------------
@@ -702,7 +791,7 @@ show_limits(){
     printf "%-8s %-8s %-6s %-8s %-20s\n" "$type" "$key" "$dir" "${mbps}M" "$meta"
   done < "$DB_FILE"
   echo -e "--------------------------------------------------------"
-  read -p "按回车返回..."
+  read -r -p "按回车返回..."
 }
 
 # ----------------- 6) Remove Xray Limits -----------------
@@ -710,7 +799,7 @@ menu_remove_xray_limits(){
   echo -e "\n${BLUE}--- 移除 Xray 限速 ---${PLAIN}"
   echo -e "1) 移除 出站\n2) 移除 入站\n3) 全部移除"
   echo -e "0) 返回主菜单"
-  read -p "选择: " sel
+  read -r -p "选择: " sel
   if [[ "$sel" == "0" ]]; then return; fi
 
   init_all >/dev/null 2>&1 || true
@@ -736,7 +825,7 @@ menu_remove_xray_limits(){
      echo -e "${GREEN}Xray 入站限制已移除${PLAIN}"
   }
 
-  read -p "操作完成，按回车返回..."
+  read -r -p "操作完成，按回车返回..."
 }
 
 # ----------------- 7) Reset All -----------------
@@ -752,8 +841,9 @@ reset_all(){
   iptables_cleanup_xray_mark
 
   : > "$DB_FILE"
+  remove_restore_service
   echo -e "${GREEN}已重置所有 TC/NFT/iptables 规则${PLAIN}"
-  read -p "操作完成，按回车返回..."
+  read -r -p "操作完成，按回车返回..."
 }
 
 # ----------------- 8) Speedtest -----------------
@@ -853,7 +943,7 @@ install_ookla_speedtest(){
 
 run_ookla_speedtest(){
   if ! command -v speedtest >/dev/null 2>&1; then
-    install_ookla_speedtest || { echo -e "${RED}安装失败${PLAIN}"; read -p "回车返回..."; return; }
+    install_ookla_speedtest || { echo -e "${RED}安装失败${PLAIN}"; read -r -p "回车返回..."; return; }
   fi
 
   echo -e "\n${BLUE}========== Speedtest by Ookla (Global + Domestic) ==========${PLAIN}"
@@ -879,7 +969,7 @@ run_ookla_speedtest(){
 
   echo -e "------------------------------------------------------------------------"
   echo -e "0) 返回主菜单"
-  read -p "请输入序号/ID (直接回车自动, 0返回): " selection
+  read -r -p "请输入序号/ID (直接回车自动, 0返回): " selection
   if [[ "$selection" == "0" ]]; then return; fi
 
   local sid=""
@@ -916,7 +1006,7 @@ run_ookla_speedtest(){
   echo -e "${CYAN}正在连接测速服务器...${PLAIN}\n"
   if [[ -n "$sid" ]]; then speedtest --server-id="$sid" --progress=yes; else speedtest --progress=yes; fi
   echo -e "${BLUE}========================================${PLAIN}"
-  read -p "测试完成，按回车返回..."
+  read -r -p "测试完成，按回车返回..."
 }
 
 # ----------------- 9) Monitor -----------------
@@ -966,19 +1056,43 @@ monitor_stats(){
 # ----------------- 10) Uninstall -----------------
 do_uninstall(){
   echo -e "${RED}警告：这将清除所有限速规则并删除脚本配置文件！${PLAIN}"
-  read -p "确定要继续吗? (y/N): " confirm
-  [[ "$confirm" != "y" ]] && return
+  read -r -p "确定要继续吗? (y/N): " confirm
+  [[ "$confirm" =~ ^[Yy]$ ]] || return
   reset_all
   rm -rf "$STATE_DIR"
   rm -f /usr/local/bin/PSL /usr/local/bin/psl >/dev/null 2>&1 || true
   echo -e "${GREEN}卸载完成。${PLAIN}"; exit 0
 }
 
+# ----------------- 开机恢复：按 DB 记录重新下发 -----------------
+restore_all(){
+  [[ -s "$DB_FILE" ]] || { echo "没有限速记录，无需恢复"; return 0; }
+  init_all || { echo -e "${RED}[FAIL]${PLAIN} 初始化 HTB/IFB 失败"; return 1; }
+  local snap type key dir mbps _ts meta uid rc=0
+  # apply_* 会改写 DB，先拷一份再逐条处理
+  snap="$(mktemp)"
+  cp -f "$DB_FILE" "$snap"
+  while IFS='|' read -r type key dir mbps _ts meta; do
+    case "$type:$dir" in
+      PORT:out|PORT:in) apply_port_limit_one "$key" "$dir" "$mbps" || rc=1 ;;
+      XRAY:out)
+        uid="$(grep -o 'uid=[0-9]*' <<<"$meta" | head -n 1 | cut -d= -f2)"
+        apply_xray_out_limit "$mbps" "$uid" </dev/null || rc=1 ;;
+      XRAY:in)
+        # Xray 可能比本服务晚启动，等它开始监听（最多 60 秒）
+        for _ in $(seq 1 12); do [[ -n "$(get_xray_listen_ports)" ]] && break; sleep 5; done
+        apply_xray_in_limit "$mbps" || rc=1 ;;
+    esac
+  done < "$snap"
+  rm -f "$snap"
+  return "$rc"
+}
+
 # ----------------- Menu -----------------
 show_menu(){
   clear
   echo -e "=================================================="
-  echo -e "   VPS 流量控制台 V10.30 (Precision HTB)"
+  echo -e "   VPS 流量控制台 V10.31 (Precision HTB)"
   echo -e "   网卡: ${GREEN}${INTERFACE}${PLAIN} | IFB: ${GREEN}${IFB_DEV}${PLAIN}"
   echo -e "   nftables: $(mark_status)"
   echo -e "=================================================="
@@ -995,7 +1109,7 @@ show_menu(){
   echo -e "10. 彻底卸载与清理"
   echo -e "0. 退出"
   echo -e "=================================================="
-  read -p "选择: " c
+  read -r -p "选择: " c
 
   case "$c" in
     1) menu_list_ports ;;
@@ -1009,10 +1123,17 @@ show_menu(){
     9) monitor_stats ;;
     10) do_uninstall ;;
     0) exit 0 ;;
-    *) show_menu ;;
+    *) ;;
   esac
-  show_menu
 }
 
 install_psl_command >/dev/null 2>&1 || true
-show_menu
+case "${1:-}" in
+  restore) restore_all; exit $? ;;
+  "") ;;
+  *)
+    echo "用法: PSL            打开菜单"
+    echo "      PSL restore    按限速记录重新下发规则（开机时自动执行）"
+    exit 2 ;;
+esac
+while true; do show_menu; done
